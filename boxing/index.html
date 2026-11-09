@@ -134,7 +134,7 @@
 
     .small-note { font-size: 12px; opacity: 0.5; margin-top: 18px; }
   </style>
-  <script type="importmap">{ "imports": { "three": "./vendor/three.module.min.js" } }</script>
+  <script type="importmap">{ "imports": { "three": "./vendor/three.module.min.js", "peerjs": "https://cdn.jsdelivr.net/npm/peerjs@1.5.5/+esm" } }</script>
 </head>
 <body>
   <div id="app"></div>
@@ -208,7 +208,7 @@
       <p class="tag" id="lobby-status"></p>
       <div class="field"><label for="nick">Your name</label><input id="nick" maxlength="16" autocomplete="off" placeholder="Boxer"></div>
       <button id="host-btn" class="big">HOST A MATCH</button>
-      <h3>Open matches</h3>
+      <h3 id="list-head">Open matches</h3>
       <div id="match-list"></div>
       <div class="field join"><label for="code-input">Match code</label><input id="code-input" maxlength="8" autocomplete="off" placeholder="e.g. K7Q2M"><button id="join-btn">JOIN</button></div>
       <button id="lobby-back">BACK</button>
@@ -218,7 +218,7 @@
   <div id="waiting" class="overlay hidden">
     <div class="panel">
       <h2>WAITING FOR AN OPPONENT</h2>
-      <p class="tag">Your match is listed for anyone who has this page open. They can also join with the code</p>
+      <p class="tag" id="wait-note">Your match is listed for anyone who has this page open. They can also join with the code</p>
       <div class="code" id="wait-code"></div>
       <button id="cancel-host">CANCEL</button>
     </div>

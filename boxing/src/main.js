@@ -775,9 +775,12 @@ function mpUpdate(dt, dtReal, now) {
   if (!mp.started) {
     if (mp.role === 'guest') {
       const me = net.myPeer();
-      if (rp && mp.rs?.opp && me && mp.rs.opp !== me) { lobbyError('That match already has two fighters.'); return; }
+      const noMatch = `No open match found with code ${String(net.code).toUpperCase()}.`;
+      if (net.full || (rp && mp.rs?.opp && me && mp.rs.opp !== me)) { lobbyError('That match already has two fighters.'); return; }
+      if (net.unreachable) { lobbyError(noMatch); return; }
       if (rp && me && mp.rs?.opp === me && mp.rs.m && mp.rs.m.phase !== 'waiting') beginOnlineMatch();
-      else if (!rp && now - mp.joinT > 8000) { lobbyError(`No open match found with code ${net.code}.`); return; }
+      // a direct connection can take a few seconds to set up
+      else if (!rp && now - mp.joinT > (net.kind === 'p2p' ? 15000 : 8000)) { lobbyError(noMatch); return; }
     } else {
       hostTick(dt, dtReal);
       if (mp.m.phase !== 'waiting') beginOnlineMatch();
@@ -822,12 +825,17 @@ async function openLobby() {
   if (!net.available) await net.init();
   const ok = net.available;
   for (const id of ['host-btn', 'join-btn', 'code-input']) $(id).disabled = !ok;
+  $('list-head').hidden = $('match-list').hidden = ok && !net.canList;
   if (!ok) {
-    lobbyStatus('Online play works on the hosted page on claude.ai. Open it there, signed in, and share it with whoever you want to fight.');
+    lobbyStatus(net.blockedHere
+      ? 'Online play on claude.ai needs you to be signed in, with access to this page from whoever shared it.'
+      : 'Online play needs a browser that supports WebRTC, such as a current Chrome, Edge, Firefox or Safari.');
     renderLobby([]);
     return;
   }
-  lobbyStatus('Host a match, or join one that someone else is hosting. Anyone you share this page with can see open matches while they have it open.');
+  lobbyStatus(net.canList
+    ? 'Host a match, or join one that someone else is hosting. Anyone you share this page with can see open matches while they have it open.'
+    : 'Host a match and send your opponent the code, or enter the code they sent you.');
   renderLobby(net.openMatches());
 }
 
@@ -871,11 +879,16 @@ async function hostMatch() {
     resetMp('host');
     const code = await net.host(playerName());
     $('lobby').classList.add('hidden');
+    $('wait-note').textContent = net.canList
+      ? 'Your match is listed for anyone who has this page open. They can also join with the code'
+      : 'Send your opponent this code. They open the game, choose Play online and enter it.';
     $('wait-code').textContent = code.toUpperCase();
     $('waiting').classList.remove('hidden');
   } catch {
     resetMp(null);
-    lobbyStatus('Could not open a match right now. Try again in a moment.');
+    lobbyStatus(net.kind === 'p2p'
+      ? "Couldn't reach the matchmaking server. Check your connection and try again."
+      : 'Could not open a match right now. Try again in a moment.');
   }
 }
 

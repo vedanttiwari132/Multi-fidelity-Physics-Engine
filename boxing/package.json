@@ -1,0 +1,17 @@
+{
+  "name": "knockout-physics",
+  "private": true,
+  "type": "module",
+  "description": "First-person physics boxing for the browser",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "python3 -m http.server 8000"
+  },
+  "dependencies": {
+    "peerjs": "1.5.5",
+    "three": "0.160.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.0"
+  }
+}

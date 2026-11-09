@@ -9,19 +9,41 @@ A first-person boxing game where the fighting is driven by physics, not canned a
 - **Telegraphed attacks.** The glove he's about to throw glows, and a ring around your sights lights up on the side it's coming from, with a hint for how to avoid it. Slip or duck it and he's left open for a counter.
 - **Knockout cam.** Every knockdown is replayed in slow motion from a third-person camera, using a recording of the last couple of seconds of the physics simulation.
 - **Ragdoll joint limits and self-collision.** Knees are hinges that can't bend backwards, the neck and spine have range limits, and every pair of body parts that isn't directly joined collides, so limbs can't pass through the body.
-- **Online play.** On the hosted claude.ai page, *Play online* lets you host a match (it's listed for everyone who has the page open, and has a short join code) or join one. Each fighter decides whether a punch reached their own head and reports it back, so a dodge that worked on your screen always counts. The host keeps the match clock. Online play needs the page's `room` capability, so it is switched off when you run the game from a local server.
+- **Online play.** *Play online* lets you host a match with a short join code, or join one. On the claude.ai page open matches are also listed. Each fighter decides whether a punch reached their own head and reports it back, so a dodge that worked on your screen always counts. The host keeps the match clock.
 - Press **V** in-game to see the physics skeleton (particles + constraints).
 
 ## Run it
 
-ES modules need to be served over HTTP (opening the file directly won't work):
+For development, serve the folder (ES modules don't load from `file://`):
 
 ```bash
 cd boxing
 python3 -m http.server 8000
 ```
 
-Then open <http://localhost:8000>. Three.js is vendored in `vendor/`, so it works offline. No build step.
+Then open <http://localhost:8000>.
+
+## Put it online so anyone can play
+
+Build one self-contained page (game, Three.js and PeerJS in a single file):
+
+```bash
+cd boxing
+npm install
+npm run build
+```
+
+That writes `dist/index.html`, which works on any static host, or opened straight from disk. Some options:
+
+- **itch.io**: zip `dist/index.html`, create a project with kind *HTML*, upload the zip and tick *This file will be played in the browser*.
+- **Netlify**: drag the `dist` folder onto <https://app.netlify.com/drop>.
+- **GitHub Pages**: no build needed. Publish the repository with Pages and the game is at `/boxing/` (`src/` loads directly; PeerJS comes from a CDN).
+
+### How online play works there
+
+Outside claude.ai, two browsers connect directly to each other over WebRTC using [PeerJS](https://peerjs.com/). The host's match code is registered with PeerJS's free public matchmaking server, and the guest connects with that code, so you don't need a server of your own. Matches are joined by code; there's no list of open matches. On very strict networks (some offices and schools) a direct connection can fail; adding a TURN server fixes that. To use your own PeerJS server or a TURN server, set `window.KNOCKOUT_PEER` (PeerJS options, e.g. `{ host, port, path, secure, config: { iceServers: [...] } }`) before the game script runs.
+
+On the claude.ai page the game uses the artifact `room` capability instead, which also lists open matches.
 
 ## Controls
 
@@ -51,7 +73,8 @@ Then open <http://localhost:8000>. Three.js is vendored in `vendor/`, so it work
 | `src/player.js` | First-person controller, PD-driven gloves, punch trajectories, head-recoil springs |
 | `src/arena.js` | Ring, physical ropes, lights, crowd |
 | `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, rounds / knockdowns, knockout cam, online match flow, HUD, input |
-| `src/net.js` | Lobby, hosting and joining matches over the artifact `room` capability |
+| `src/net.js` | Hosting and joining matches: claude.ai `room` capability, or PeerJS (WebRTC) everywhere else |
+| `build.mjs` | Bundles everything into `dist/index.html` for static hosting |
 | `src/audio.js` | Synthesised WebAudio sound effects (no asset files) |
 
 Tuning knobs worth playing with: `DIFFICULTY` and `PUNCHES` in `fighter.js`, `PUNCHES` and `ARM` in `player.js`, and the damage formulas in `onGloveContact` / `onPlayerStruck` in `main.js`.
