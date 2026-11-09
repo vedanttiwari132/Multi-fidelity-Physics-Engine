@@ -102,7 +102,7 @@ export class Player {
     this.gloves[index].queued = type;
   }
 
-  /** Head movement: 'left' / 'right' slip or 'back' pull. */
+  /** Head movement: slip 'left' or 'right'. */
   requestDodge(dir) {
     if (this.mode !== 'fight' || this.dodge || this.dodgeCd > 0 || this.stamina < 4) return false;
     this.stamina -= 6;
@@ -117,7 +117,8 @@ export class Player {
     const def = PUNCHES[type];
     const tired = this.stamina < def.cost;
     this.stamina = Math.max(0, this.stamina - def.cost);
-    g.punch = { type, def, t: 0, phase: 'wind', done: false, power: def.power * (tired ? 0.6 : 1) };
+    this.punchSeq = (this.punchSeq || 0) + 1;
+    g.punch = { type, def, t: 0, phase: 'wind', done: false, power: def.power * (tired ? 0.6 : 1), seq: this.punchSeq };
     this.onPunch?.(g, type);
   }
 
@@ -128,8 +129,7 @@ export class Player {
 
     // --- footwork
     let fx = 0, fz = 0;
-    const shift = k.has('ShiftLeft') || k.has('ShiftRight');
-    if (active && !shift) {
+    if (active) {
       if (k.has('KeyW')) fz += 1;
       if (k.has('KeyS')) fz -= 1;
       if (k.has('KeyD')) fx += 1;
@@ -160,8 +160,7 @@ export class Player {
       const d = this.dodge;
       d.t += h;
       if (d.t < 0.55) {
-        if (d.dir === 'back') { oy = -0.03; oz = 0.34; }
-        else { ox = d.dir === 'left' ? -0.34 : 0.34; oy = -0.1; oz = 0.04; }
+        ox = d.dir === 'left' ? -0.34 : 0.34; oy = -0.1; oz = 0.04;
       }
       if (d.t > 0.78) { this.dodge = null; this.dodgeCd = 0.1; }
     }
@@ -428,8 +427,14 @@ class PlayerAvatar {
     this.belt = add(cyl, trim); this.belt.scale.set(0.18, 0.05, 0.13);
     this.shoulders = [add(sphere, skin), add(sphere, skin)];
     for (const m of this.shoulders) m.scale.setScalar(0.075);
+    this.phase = 0;   // stepping cycle, advanced by how fast you move (same as the opponent's)
     this.legs = [-1, 1].map(() => ({ thigh: add(cyl, skin), shin: add(cyl, skin), knee: add(sphere, skin),
       shoe: add(new THREE.BoxGeometry(0.1, 0.08, 0.25), trim) }));
+  }
+
+  tick(dt) {
+    const p = this.player;
+    this.phase += Math.hypot(p.vel.x, p.vel.z) * dt * 11;
   }
 
   update() {
@@ -453,17 +458,24 @@ class PlayerAvatar {
     orient(this.head, left, _f); this.head.position.copy(head);
     placeCylinder(this.neck, sMid, head, 0.06);
 
+    const speed = Math.hypot(p.vel.x, p.vel.z);
+    const amt = Math.min(1, speed * 1.5);
+    const mx = speed > 1e-4 ? p.vel.x / speed : 0, mz = speed > 1e-4 ? p.vel.z / speed : 0;
     this.legs.forEach((leg, i) => {
       const side = i === 0 ? 1 : -1;        // +1 = left
+      const ph = this.phase + (i === 0 ? 0 : Math.PI);
       const fwdOff = side > 0 ? 0.17 : -0.15;
       const hipJ = _t.copy(hip).addScaledVector(left, side * 0.11);
-      const foot = _b.set(p.pos.x + left.x * side * 0.15 + fwd.x * fwdOff, 0.07, p.pos.z + left.z * side * 0.15 + fwd.z * fwdOff);
+      const shuffle = Math.cos(ph) * 0.08 * amt;
+      const foot = _b.set(p.pos.x + left.x * side * 0.15 + fwd.x * fwdOff + mx * shuffle,
+        0.07 + Math.max(0, Math.sin(ph)) * 0.09 * amt,
+        p.pos.z + left.z * side * 0.15 + fwd.z * fwdOff + mz * shuffle);
       _a.copy(fwd).addScaledVector(left, side * 0.25);
       solveTwoBone(hipJ, foot, 0.41, 0.44, _a, _el);
       placeCylinder(leg.thigh, hipJ, _el, 0.08);
       placeCylinder(leg.shin, _el, foot, 0.058);
       leg.knee.position.copy(_el); leg.knee.scale.setScalar(0.068);
-      leg.shoe.position.copy(foot).addScaledVector(fwd, 0.05); leg.shoe.position.y = 0.05;
+      leg.shoe.position.copy(foot).addScaledVector(fwd, 0.05); leg.shoe.position.y = foot.y - 0.02;
       leg.shoe.rotation.set(0, yaw, 0);
     });
   }

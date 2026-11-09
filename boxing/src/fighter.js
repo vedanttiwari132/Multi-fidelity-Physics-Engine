@@ -7,7 +7,7 @@
 // knockdown, at which point the body simply collapses under gravity.
 
 import * as THREE from 'three';
-import { Particle, DistanceConstraint, solveTwoBone } from './physics.js';
+import { Particle, DistanceConstraint, HingeConstraint, solveTwoBone } from './physics.js';
 
 export const UPPER_ARM = 0.31, FOREARM = 0.34, THIGH = 0.41, SHIN = 0.44;
 const G = 9.81;
@@ -49,6 +49,14 @@ const LINKS = [
   ['shoulderL', 'handL', 1, 'min', 0.14], ['shoulderR', 'handR', 1, 'min', 0.14],
   ['hipL', 'footL', 1, 'min', 0.4], ['hipR', 'footR', 1, 'min', 0.4],
   ['handL', 'handR', 1, 'min', 0.21], ['kneeL', 'kneeR', 1, 'min', 0.16], ['footL', 'footR', 1, 'min', 0.18],
+  // joint range limits
+  ['head', 'belly', 1, 'min'],                                     // neck can't fold the head onto the chest
+  ['neck', 'pelvis', 1, 'min', 0.5], ['chest', 'hipL', 0.8, 'min', 0.36], ['chest', 'hipR', 0.8, 'min', 0.36], // spine bend
+  ['elbowL', 'belly', 1, 'min', 0.2], ['elbowR', 'belly', 1, 'min', 0.2],      // arms stay outside the torso
+  ['elbowL', 'pelvis', 1, 'min', 0.2], ['elbowR', 'pelvis', 1, 'min', 0.2],
+  ['kneeL', 'belly', 1, 'min', 0.3], ['kneeR', 'belly', 1, 'min', 0.3],        // thighs can't fold into the stomach
+  ['kneeL', 'chest', 1, 'min', 0.42], ['kneeR', 'chest', 1, 'min', 0.42],
+  ['footL', 'pelvis', 1, 'min', 0.3], ['footR', 'pelvis', 1, 'min', 0.3],
 ];
 
 const REGION = {
@@ -110,8 +118,29 @@ export class Opponent {
       this.target[name] = new THREE.Vector3();
       this.lastTarget[name] = new THREE.Vector3();
     }
+    const linked = new Set();
     for (const [a, b, stiffness, mode = 'equal', length = null] of LINKS) {
       world.addConstraint(new DistanceConstraint(this.p[a], this.p[b], { stiffness, mode, length }));
+      linked.add(a + '|' + b); linked.add(b + '|' + a);
+    }
+    // Knees only bend forwards.
+    for (const s of ['L', 'R']) {
+      world.addConstraint(new HingeConstraint(this.p['hip' + s], this.p['knee' + s], this.p['foot' + s], this.p.hipR, this.p.hipL));
+    }
+    // Self-collision: every pair of body parts that isn't directly joined and doesn't
+    // overlap at rest is kept at least (r1 + r2) apart, so limbs can't pass through the body.
+    const names = Object.keys(REST);
+    this.selfCollisions = 0;
+    for (let i = 0; i < names.length; i++) {
+      for (let j = i + 1; j < names.length; j++) {
+        const a = names[i], b = names[j];
+        if (linked.has(a + '|' + b)) continue;
+        const pa = this.p[a], pb = this.p[b];
+        const minD = pa.radius + pb.radius;
+        if (pa.pos.distanceTo(pb.pos) < minD * 1.02) continue;
+        world.addConstraint(new DistanceConstraint(pa, pb, { mode: 'min', length: minD, stiffness: 0.8 }));
+        this.selfCollisions++;
+      }
     }
 
     this.hands = {
@@ -127,6 +156,9 @@ export class Opponent {
     this.moveVel = new THREE.Vector3();
     this.desiredVel = new THREE.Vector3();
     this.diff = DIFFICULTY.normal;
+    /** Online play: when set, the body is driven by another player's state instead of the AI.
+     *  { pos, vel, head, gloves: [left, right], yaw } in world space (their camera yaw). */
+    this.remote = null;
     this.onSwing = null;
     this.view = new FighterView(scene, this);
     this.reset(0, -1.6, 0);
@@ -182,7 +214,16 @@ export class Opponent {
     this.twist += (this.twistT - this.twist) * k;
 
     const upright = this.mode === 'fight' || this.mode === 'idle';
-    if (upright && this.tone > 0.3) {
+    if (this.remote && upright) {
+      // Follow the other player's feet, slightly extrapolated to hide network delay.
+      const r = this.remote;
+      _w.set(r.pos.x + r.vel.x * 0.05, 0, r.pos.z + r.vel.z * 0.05);
+      this.base.lerp(_w, 1 - Math.exp(-h * 14));
+      this.moveVel.copy(r.vel);
+      let dy = (r.yaw + Math.PI) - this.yaw;
+      dy = Math.atan2(Math.sin(dy), Math.cos(dy));
+      this.yaw += dy * (1 - Math.exp(-h * 16));
+    } else if (upright && this.tone > 0.3) {
       this.moveVel.lerp(this.desiredVel, 1 - Math.exp(-h * 8));
       this.base.addScaledVector(this.moveVel, h);
       // Let the stance "give" when the body is shoved: base follows the real pelvis.
@@ -255,6 +296,13 @@ export class Opponent {
 
   handTarget(hand, h, ctx, out) {
     const sd = hand.side;
+    if (this.remote) {
+      // Their left glove is this body's left hand.
+      out.copy(this.remote.gloves[sd > 0 ? 0 : 1]);
+      hand.omega = 30; hand.maxAcc = 420;
+      hand.pole.set(sd * 0.7, -1, -0.2);
+      return out;
+    }
     hand.omega = 18; hand.maxAcc = 90;
     hand.pole.set(sd * 0.7, -1, -0.2);
     // guard position (local)
@@ -342,7 +390,27 @@ export class Opponent {
     this.incoming = { at: time + this.diff.react * (0.8 + Math.random() * 0.5), low };
   }
 
+  /** Online: posture follows where the other player holds their head (slips, ducks, leans). */
+  thinkRemote(dt) {
+    const r = this.remote;
+    if (this.mode === 'down') this.tone = Math.max(0, this.tone - dt * 5);
+    else if (this.mode === 'rising') {
+      this.tone = Math.min(1, this.tone + dt * 0.75);
+      if (this.tone >= 1) this.mode = 'fight';
+    } else this.tone = 1;
+    const fx = -Math.sin(r.yaw), fz = -Math.cos(r.yaw);   // their forward
+    const lx = -Math.cos(r.yaw), lz = Math.sin(r.yaw);    // their left
+    const dx = r.head.x - r.pos.x, dz = r.head.z - r.pos.z;
+    this.leanT = THREE.MathUtils.clamp((dx * fx + dz * fz) / 1.4, -0.2, 0.3);
+    this.slipT = THREE.MathUtils.clamp((dx * lx + dz * lz) / 1.4, -0.3, 0.3);
+    this.crouchT = THREE.MathUtils.clamp(1.6 - r.head.y, -0.05, 0.45);
+    this.twistT = 0;
+    this.cover = false; this.coverLow = false;
+    this.desiredVel.set(0, 0, 0);
+  }
+
   think(dt, ctx) {
+    if (this.remote) { this.thinkRemote(dt); return; }
     this.daze = Math.max(0, this.daze - dt * 0.22);
     this.winded = Math.max(0, (this.winded || 0) - dt * 0.08);
     this.coverT -= dt; this.coverLowT = (this.coverLowT || 0) - dt; this.slipTimer -= dt; this.tacticT -= dt; this.attackCd -= dt; this.staggerT -= dt;

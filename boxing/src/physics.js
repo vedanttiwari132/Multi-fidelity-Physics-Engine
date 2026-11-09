@@ -62,6 +62,36 @@ export class DistanceConstraint {
   }
 }
 
+/**
+ * Hinge limit: keeps joint `b` (a knee) on the front side of the line a–c.
+ * "Front" is (c − a) × axis, with the axis running between two other particles
+ * (e.g. right hip → left hip). Stops the joint from bending backwards.
+ */
+export class HingeConstraint {
+  constructor(a, b, c, axisFrom, axisTo, { margin = 0.02, stiffness = 1 } = {}) {
+    Object.assign(this, { a, b, c, axisFrom, axisTo, margin, stiffness });
+    this.enabled = true;
+  }
+
+  solve() {
+    const { a, b, c } = this;
+    _a.subVectors(c.pos, a.pos);
+    _v.subVectors(this.axisTo.pos, this.axisFrom.pos);
+    _n.crossVectors(_a, _v);
+    const nl = _n.length();
+    if (nl < 1e-9) return;
+    _n.multiplyScalar(1 / nl);
+    const d = _v.subVectors(b.pos, a.pos).dot(_n) - this.margin;
+    if (d >= 0) return;
+    const denom = b.invMass + 0.25 * (a.invMass + c.invMass);
+    if (denom === 0) return;
+    const lambda = (-d / denom) * this.stiffness;
+    b.pos.addScaledVector(_n, lambda * b.invMass);
+    a.pos.addScaledVector(_n, -0.5 * lambda * a.invMass);
+    c.pos.addScaledVector(_n, -0.5 * lambda * c.invMass);
+  }
+}
+
 export class World {
   constructor({ gravity = new THREE.Vector3(0, -9.81, 0), iterations = 6, groundY = 0 } = {}) {
     this.gravity = gravity;

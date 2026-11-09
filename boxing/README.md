@@ -8,6 +8,8 @@ A first-person boxing game where the fighting is driven by physics, not canned a
 - **The ropes** are Verlet chains that he bounces off.
 - **Telegraphed attacks.** The glove he's about to throw glows, and a ring around your sights lights up on the side it's coming from, with a hint for how to avoid it. Slip or duck it and he's left open for a counter.
 - **Knockout cam.** Every knockdown is replayed in slow motion from a third-person camera, using a recording of the last couple of seconds of the physics simulation.
+- **Ragdoll joint limits and self-collision.** Knees are hinges that can't bend backwards, the neck and spine have range limits, and every pair of body parts that isn't directly joined collides, so limbs can't pass through the body.
+- **Online play.** On the hosted claude.ai page, *Play online* lets you host a match (it's listed for everyone who has the page open, and has a short join code) or join one. Each fighter decides whether a punch reached their own head and reports it back, so a dodge that worked on your screen always counts. The host keeps the match clock. Online play needs the page's `room` capability, so it is switched off when you run the game from a local server.
 - Press **V** in-game to see the physics skeleton (particles + constraints).
 
 ## Run it
@@ -29,10 +31,9 @@ Then open <http://localhost:8000>. Three.js is vendored in `vendor/`, so it work
 | LMB / RMB | Left jab / right cross |
 | Q / E | Left hook / right hook |
 | Shift + Q / E | Left / right body hook |
-| Shift + click | Uppercut |
+| Z / X | Left / right uppercut |
 | Space (hold) | Guard (blocks clean shots, but drains stamina and some damage gets through) |
-| Shift + A / D | Slip left / right |
-| Shift + S | Pull back |
+| Shift + LMB / RMB | Slip left / right |
 | C (hold) | Duck |
 | WASD | Footwork |
 | V | Physics debug view |
@@ -49,7 +50,8 @@ Then open <http://localhost:8000>. Three.js is vendored in `vendor/`, so it work
 | `src/fighter.js` | Opponent ragdoll, muscle controller, AI (stalk / combo / retreat, blocking and slipping), visuals |
 | `src/player.js` | First-person controller, PD-driven gloves, punch trajectories, head-recoil springs |
 | `src/arena.js` | Ring, physical ropes, lights, crowd |
-| `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, rounds / knockdowns, HUD, input |
+| `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, rounds / knockdowns, knockout cam, online match flow, HUD, input |
+| `src/net.js` | Lobby, hosting and joining matches over the artifact `room` capability |
 | `src/audio.js` | Synthesised WebAudio sound effects (no asset files) |
 
 Tuning knobs worth playing with: `DIFFICULTY` and `PUNCHES` in `fighter.js`, `PUNCHES` and `ARM` in `player.js`, and the damage formulas in `onGloveContact` / `onPlayerStruck` in `main.js`.

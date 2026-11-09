@@ -7,6 +7,7 @@ import { Player } from './player.js';
 import { Arena } from './arena.js';
 import { Sfx } from './audio.js';
 import { PhysicsDebugView } from './debug.js';
+import { Net, cleanName } from './net.js';
 
 const STEP = 1 / 240;      // physics rate
 const MAX_STEPS = 16;
@@ -42,7 +43,7 @@ const game = {
   round: 1, timer: ROUND_TIME, difficulty: 'normal',
   time: 0, timeScale: 1, slowmo: 0, phaseT: 0,
   count: 0, countT: 0, downWho: null, getUpAt: 0,
-  paused: false, noLock: false, vignette: 0, lagP: 100, lagO: 100, counterUntil: -1,
+  paused: false, overlay: false, noLock: false, vignette: 0, lagP: 100, lagO: 100, counterUntil: -1,
   stats: null,
 };
 const ctx = { playerPos: player.pos, playerHead: player.headPos, playerChest: player.chestPos, time: 0 };
@@ -118,6 +119,7 @@ function onGloveContact(g, p, speed) {
     sfx.block(speed / 8);
     const broken = player.stamina <= 0;
     if (!broken) hp.hit = true;   // guard held: no clean shot; broken guard: the glove can still reach your head
+    publishHit(hp, chip, 2, Math.max(speed, hp.speed || 0), 0, false);
     showImpact(broken ? 'GUARD BROKEN' : guarded ? 'BLOCKED' : 'PARRIED', `−${drain.toFixed(0)} stamina${chip ? ` · −${chip.toFixed(1)} health` : ''}`);
     if (player.health <= 0 && player.mode === 'fight') playerKnockdown();
     return;
@@ -127,6 +129,10 @@ function onGloveContact(g, p, speed) {
   pu.done = true;
   const mu = (GLOVE_MASS * p.mass) / (GLOVE_MASS + p.mass);
   const energy = 0.5 * mu * speed * speed;
+  if (mp.on) {   // online: the person you hit decides the damage and reports it back
+    if (p.region === 'guard') sfx.block(speed / 8); else sfx.punch(Math.min(1, speed / 9), p.region);
+    return;
+  }
   if (opp.mode !== 'fight') { sfx.punch(0.2, 'body'); return; }
   if (p.region === 'guard') {
     sfx.block(speed / 8);
@@ -156,11 +162,14 @@ function onPlayerStruck(hand, speed, imp, region) {
   const pu = hand.punch;
   let dmg = 0;
   // Only a glove still travelling forward does damage, not one on its way back.
-  const travelling = pu && (pu.phase === 'ext' || (pu.phase === 'ret' && pu.t < pu.wind + pu.def.ext + 0.05));
+  const travelling = pu && (pu.phase === 'ext' || (!pu.mirror && pu.phase === 'ret' && pu.t < pu.wind + pu.def.ext + 0.05));
+  if (pu?.mirror) speed = Math.max(speed, pu.speed || 0);   // online: use their real glove speed
   if (pu && !pu.hit && travelling && speed > 1.5) {
     pu.hit = true;
-    dmg = Math.max(0, speed - 2.0) * 2.4 * opp.diff.damage * pu.def.power * (region === 'head' ? 1 : 0.5);
+    const counter = mp.on && (mp.rs?.ctr || player.gloves.some((g) => g.punch?.phase === 'ext'));
+    dmg = Math.max(0, speed - 2.0) * 2.4 * opp.diff.damage * pu.def.power * (region === 'head' ? 1 : 0.5) * (counter ? 1.25 : 1);
     if (region === 'body' && player.guarding) dmg *= 0.5;
+    publishHit(pu, dmg, region === 'head' ? 0 : 1, speed, 0.5 * (15 / 8) * speed * speed, counter);
     game.stats.taken += dmg;
     game.stats.oppLanded++;
     sfx.punch(speed / 9, region);
@@ -233,6 +242,16 @@ function oppKnockdown(info) {
 }
 
 function playerKnockdown() {
+  if (mp.on) {   // online: the host counts; you mash Space to get up
+    player.knockDown();
+    game.slowmo = 0.8;
+    sfx.crowdCheer(1.2);
+    arena.excitement = 1.6;
+    $('recover').classList.remove('hidden');
+    $('recover-text').textContent = player.knockdowns >= 3 ? 'STAY DOWN…' : 'MASH SPACE TO GET UP';
+    banner("YOU'RE DOWN!");
+    return;
+  }
   player.knockDown();
   game.phase = 'knockdown';
   game.downWho = 'player';
@@ -308,10 +327,11 @@ function finish(won, method) {
       ['Punches landed', `${s.landed} / ${s.thrown} (${acc}%)`],
       ['Damage dealt / taken', `${s.dealt.toFixed(0)} / ${s.taken.toFixed(0)}`],
       ['Hardest punch', `${s.topSpeed.toFixed(1)} m/s · ${s.topEnergy.toFixed(0)} J`],
-      ['His punches blocked / dodged', `${s.blocked} / ${s.dodged}`],
-      ['Knockdowns (you / him)', `${opp.knockdowns || 0} / ${player.knockdowns}`],
+      ['Their punches blocked / dodged', `${s.blocked} / ${s.dodged}`],
+      ['Knockdowns (scored / suffered)', `${opp.knockdowns || 0} / ${player.knockdowns}`],
     ];
     $('res-stats').innerHTML = rows.map(([a, b]) => `<div>${a}</div><div>${b}</div>`).join('');
+    $('again').textContent = mp.on ? 'BACK TO LOBBY' : 'REMATCH';
     $('results').classList.remove('hidden');
     if (document.pointerLockElement) document.exitPointerLock();
   }, 2600);
@@ -339,8 +359,9 @@ function toMenu() {
 const KO_BEFORE = 0.8, KO_AFTER = 1.15;
 const REC_FRAMES = 480;
 const NP = world.particles.length;
-const rec = { t: new Float64Array(REC_FRAMES), pos: new Float32Array(REC_FRAMES * NP * 3), extra: new Float32Array(REC_FRAMES * 6), head: 0, count: 0 };
-const live = { pos: new Float32Array(NP * 3), prev: new Float32Array(NP * 3), extra: new Float32Array(6) };
+const NX = 9;   // extra per-frame values (see extrasInto)
+const rec = { t: new Float64Array(REC_FRAMES), pos: new Float32Array(REC_FRAMES * NP * 3), extra: new Float32Array(REC_FRAMES * NX), head: 0, count: 0 };
+const live = { pos: new Float32Array(NP * 3), prev: new Float32Array(NP * 3), extra: new Float32Array(NX) };
 const ko = { hitTime: 0, t: 0, info: null, skip: false, impactPlayed: false, center: new THREE.Vector3(), angle0: 0, shake: 0 };
 const _look = new THREE.Vector3();
 const _bodyQ = { quaternion: new THREE.Quaternion() };
@@ -348,10 +369,12 @@ const _bodyQ = { quaternion: new THREE.Quaternion() };
 function extrasInto(arr, o) {
   arr[o] = player.pos.x; arr[o + 1] = player.pos.z; arr[o + 2] = player.yaw; arr[o + 3] = player.twist;
   arr[o + 4] = opp.yaw; arr[o + 5] = player.duck;
+  arr[o + 6] = player.vel.x; arr[o + 7] = player.vel.z; arr[o + 8] = player.avatar.phase;
 }
 function extrasFrom(arr, o) {
   player.pos.x = arr[o]; player.pos.z = arr[o + 1]; player.yaw = arr[o + 2]; player.twist = arr[o + 3];
   opp.yaw = arr[o + 4]; player.duck = arr[o + 5];
+  player.vel.x = arr[o + 6]; player.vel.z = arr[o + 7]; player.avatar.phase = arr[o + 8];
 }
 
 function recordFrame() {
@@ -359,7 +382,7 @@ function recordFrame() {
   rec.t[i] = game.time;
   const base = i * NP * 3;
   world.particles.forEach((p, k) => { rec.pos[base + k * 3] = p.pos.x; rec.pos[base + k * 3 + 1] = p.pos.y; rec.pos[base + k * 3 + 2] = p.pos.z; });
-  extrasInto(rec.extra, i * 6);
+  extrasInto(rec.extra, i * NX);
   rec.head = (i + 1) % REC_FRAMES;
   rec.count = Math.min(REC_FRAMES, rec.count + 1);
 }
@@ -385,7 +408,7 @@ function sampleReplay(time) {
       rec.pos[ba + j + 2] + (rec.pos[bb + j + 2] - rec.pos[ba + j + 2]) * u,
     );
   });
-  extrasFrom(rec.extra, u < 0.5 ? a * 6 : b * 6);
+  extrasFrom(rec.extra, u < 0.5 ? a * NX : b * NX);
 }
 
 function startKoCam() {
@@ -412,7 +435,7 @@ function startKoCam() {
 
 function updateKoCam(dtReal) {
   const near = Math.abs(ko.t - ko.hitTime);
-  const rate = 0.12 + 0.33 * Math.min(1, near / 0.35);   // slowest right at the impact
+  const rate = (0.12 + 0.33 * Math.min(1, near / 0.35)) * (mp.on ? 1.6 : 1);   // slowest right at the impact; quicker online
   ko.t += dtReal * rate;
   if (!ko.impactPlayed && ko.t >= ko.hitTime) {
     ko.impactPlayed = true;
@@ -449,15 +472,449 @@ function endKoCam() {
   player.avatar.group.visible = false;
   $('kocam').classList.add('hidden');
   $('hud').classList.remove('hidden');
-  game.phase = 'knockdown';
   game.count = 0; game.countT = 0;
+  if (mp.on) {
+    const m = mp.role === 'host' ? mp.m : mp.rs?.m;
+    game.phase = m?.phase === 'over' ? 'over' : (['intro', 'fight', 'knockdown', 'rest'].includes(m?.phase) ? m.phase : 'knockdown');
+    if (m?.phase === 'knockdown' && m.count > 0) $('count').textContent = m.count;
+  } else game.phase = 'knockdown';
+}
+
+
+// ---------------------------------------------------------------- online play
+// The host runs the match clock (rounds, knockdown counts, result). Each fighter
+// decides for themselves whether a punch reached their own head, so a dodge that
+// worked on your screen always counts, and reports what they took back to the puncher.
+const net = new Net();
+const MP_DIFF = { damage: 0.9, power: 1 };
+const PH = ['none', 'wind', 'ext', 'ret'];
+const TYPES = ['straight', 'hook', 'uppercut', 'bodyhook'];
+const TYPE_POWER = { straight: 1, hook: 1.15, uppercut: 1.15, bodyhook: 1.1 };
+const MODES = ['fight', 'idle', 'down', 'rising'];
+const remoteBody = { pos: new THREE.Vector3(), vel: new THREE.Vector3(), head: new THREE.Vector3(0, 1.6, 0), gloves: [new THREE.Vector3(), new THREE.Vector3()], yaw: 0 };
+const mp = { on: false };
+const _gv = new THREE.Vector3();
+const num = (v, lo, hi, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d);
+const r3 = (v) => Math.round(v * 1000) / 1000;
+
+function resetMp(role) {
+  Object.assign(mp, {
+    on: !!role, role, started: false, peer: null, rs: null, lastSeen: performance.now(), joinT: performance.now(),
+    hitSeq: mp.hitSeq || 0, hitLog: [], lastConfirm: 0, lastInfo: null, names: new Map(),
+    m: { phase: 'waiting', round: 1, timer: ROUND_TIME, count: 0, down: null, winner: null, method: null, epoch: 0 },
+    applied: '', shownCount: -1, phaseT: 0, countT: 0,
+  });
+}
+
+// Each fighter starts in their own corner: host at +z facing -z, guest the other way.
+const myCorner = () => (mp.role === 'host' ? [0, 1.45, 0] : [0, -1.45, Math.PI]);
+const theirCorner = () => (mp.role === 'host' ? [0, -1.45, 0] : [0, 1.45, Math.PI]);   // opponent-body yaw convention
+
+function myState() {
+  const k = [];
+  for (const g of player.gloves) {
+    const pu = g.punch;
+    k.push(pu ? PH.indexOf(pu.phase) : 0, pu ? TYPES.indexOf(pu.type) : 0, pu ? pu.seq : 0, r3(g.particle.getVelocity(STEP, _gv).length()));
+  }
+  const s = [player.pos.x, player.pos.z, player.vel.x, player.vel.z, player.yaw + player.twist,
+    player.headPos.x, player.headPos.y, player.headPos.z,
+    ...player.gloves[0].particle.pos.toArray(), ...player.gloves[1].particle.pos.toArray()].map(r3);
+  const st = { role: mp.role, name: net.name, s, k, mode: player.mode, hp: r3(player.health), kd: player.knockdowns,
+    taken: r3(game.stats.taken), ctr: game.time < game.counterUntil ? 1 : 0 };
+  if (mp.hitLog.length) st.hit = mp.hitLog;
+  if (mp.role === 'host') { st.m = mp.m; st.opp = mp.peer; }
+  return st;
+}
+
+function readRemote(p) {
+  const pr = p.presence || {};
+  const s = pr.s, k = pr.k;
+  if (!Array.isArray(s) || s.length !== 14 || !Array.isArray(k) || k.length !== 8) return false;
+  const r = remoteBody;
+  r.pos.set(num(s[0], -3.2, 3.2), 0, num(s[1], -3.2, 3.2));
+  r.vel.set(num(s[2], -5, 5), 0, num(s[3], -5, 5));
+  r.yaw = num(s[4], -1e4, 1e4);
+  r.head.set(num(s[5], -3.5, 3.5), num(s[6], 0.2, 2.2, 1.6), num(s[7], -3.5, 3.5));
+  r.gloves[0].set(num(s[8], -3.5, 3.5), num(s[9], 0, 2.4, 1.3), num(s[10], -3.5, 3.5));
+  r.gloves[1].set(num(s[11], -3.5, 3.5), num(s[12], 0, 2.4, 1.3), num(s[13], -3.5, 3.5));
+  for (const g of r.gloves) if (g.distanceTo(r.head) > 1.1) g.sub(r.head).setLength(1.1).add(r.head);   // no impossible reach
+  mp.rs = {
+    mode: MODES.includes(pr.mode) ? pr.mode : 'idle', hp: num(pr.hp, 0, 100, 100), kd: num(pr.kd, 0, 9) | 0,
+    taken: num(pr.taken, 0, 1e5), ctr: pr.ctr === 1, name: cleanName(pr.name),
+    hit: Array.isArray(pr.hit) ? pr.hit : null, m: pr.m && typeof pr.m === 'object' ? pr.m : null,
+    opp: typeof pr.opp === 'string' ? pr.opp : null,
+  };
+  mirrorPunches(k);
+  return true;
+}
+
+const AI_NAME = (type, i) => (type === 'straight' ? (i === 0 ? 'jab' : 'cross') : type === 'hook' ? (i === 0 ? 'hookL' : 'hookR')
+  : type === 'uppercut' ? 'upperR' : 'bodyR');
+
+/** Copy their punches onto the puppet's hands so blocking, dodging, the warning ring and glow all work. */
+function mirrorPunches(k) {
+  for (let i = 0; i < 2; i++) {
+    const hand = i === 0 ? opp.hands.L : opp.hands.R;
+    const ph = PH[num(k[i * 4], 0, 3) | 0], type = TYPES[num(k[i * 4 + 1], 0, 3) | 0];
+    const seq = num(k[i * 4 + 2], 0, 1e9) | 0, spd = num(k[i * 4 + 3], 0, 30);
+    let pu = hand.punch;
+    if (pu && (ph === 'none' || pu.seq !== seq)) { endMirror(pu); hand.punch = pu = null; }
+    if (ph === 'none') continue;
+    if (!pu) {
+      pu = hand.punch = { mirror: true, seq, type, name: AI_NAME(type, i), t: 0, wind: 1, phase: ph, hit: false, blocked: false, speed: 0,
+        def: { power: TYPE_POWER[type], aim: type === 'bodyhook' ? 'chest' : 'head', ext: 0.15 } };
+    }
+    if (pu.phase === 'ext' && ph !== 'ext') endMirror(pu);
+    if (ph === 'ext') { pu.sawExt = true; pu.speed = Math.max(pu.speed, spd); }
+    pu.phase = ph;
+  }
+}
+
+/** Their punch finished without touching you: reward the dodge. */
+function endMirror(pu) {
+  if (pu.ended) return;
+  pu.ended = true;
+  if (!pu.sawExt || pu.hit || pu.blocked || player.mode !== 'fight' || game.phase !== 'fight') return;
+  if (!player.dodging && player.duck < 0.15) return;
+  game.counterUntil = game.time + 0.7;
+  game.stats.dodged++;
+  player.stamina = Math.min(100, player.stamina + 6);
+  showImpact(player.dodging ? 'SLIPPED!' : 'DUCKED!', 'counter now');
+}
+
+/** You were hit (or blocked): tell the puncher. region 0 head, 1 body, 2 blocked. */
+function publishHit(pu, dmg, region, speed, energy, counter) {
+  if (!mp.on) return;
+  mp.hitSeq++;
+  // keep the last few, so two hits between network updates both get reported
+  mp.hitLog = [...mp.hitLog, [mp.hitSeq, pu.seq, r3(dmg), region, r3(speed), r3(energy), counter ? 1 : 0]].slice(-4);
+}
+
+const hitSeqOf = (h) => (Array.isArray(h) ? num(h[0], 0, 1e9) | 0 : 0);
+
+/** What your punches did, as reported by the person you hit. */
+function readConfirms(list) {
+  if (!list) return;
+  for (const h of [...list].sort((a, b) => hitSeqOf(a) - hitSeqOf(b))) readConfirm(h);
+}
+
+function readConfirm(h) {
+  if (!Array.isArray(h)) return;
+  const seq = hitSeqOf(h);
+  if (seq <= mp.lastConfirm) return;
+  mp.lastConfirm = seq;
+  const punchSeq = num(h[1], 0, 1e9) | 0, dmg = num(h[2], 0, 100), region = num(h[3], 0, 2) | 0;
+  const speed = num(h[4], 0, 30), energy = num(h[5], 0, 2000), counter = h[6] === 1;
+  if (region === 2) { showImpact('BLOCKED', speed, energy); return; }
+  game.stats.landed++;
+  game.stats.dealt += dmg;
+  game.stats.topSpeed = Math.max(game.stats.topSpeed, speed);
+  game.stats.topEnergy = Math.max(game.stats.topEnergy, energy);
+  arena.excitement += dmg / 20;
+  showImpact(counter ? 'COUNTER!' : region === 0 ? (dmg > 14 ? 'HUGE SHOT' : 'HEAD') : 'BODY SHOT', speed, energy);
+  mp.lastInfo = { name: mp.names.get(punchSeq) || 'PUNCH', speed, energy };
+}
+
+function syncRemoteMode() {
+  const rm = mp.rs.mode;
+  if (rm === 'down' && opp.mode !== 'down') { opp.knockDown(); onRemoteKnockdown(); }
+  else if ((rm === 'rising' || rm === 'fight') && opp.mode === 'down') opp.rise(mp.rs.hp);
+  else if (rm === 'idle' && opp.mode === 'fight') opp.mode = 'idle';
+  else if (rm === 'fight' && opp.mode === 'idle') opp.mode = 'fight';
+  opp.health = mp.rs.hp;
+  opp.knockdowns = mp.rs.kd;
+}
+
+function onRemoteKnockdown() {
+  if (game.phase !== 'fight' && game.phase !== 'knockdown') return;
+  ko.hitTime = game.time - 0.1;
+  ko.info = mp.lastInfo;
+  game.phase = 'kowait';
+  game.slowmo = 0.4;
+  sfx.crowdCheer(1.5);
+  arena.excitement = 2;
+  banner('KNOCKDOWN!');
+}
+
+function hostTick(dt, dtReal) {
+  const m = mp.m, rmode = mp.rs?.mode;
+  const set = (phase) => { m.phase = phase; m.epoch++; mp.phaseT = 0; };
+  mp.phaseT += dtReal;
+  switch (m.phase) {
+    case 'waiting':
+      if (mp.peer && mp.rs) { m.round = 1; m.timer = ROUND_TIME; set('intro'); }
+      break;
+    case 'intro':
+      if (mp.phaseT > 2.2) set('fight');
+      break;
+    case 'fight':
+      m.timer = Math.max(0, m.timer - dt);
+      if (player.mode === 'down') { m.down = 'host'; m.count = 0; mp.countT = 0; set('knockdown'); }
+      else if (rmode === 'down') { m.down = 'guest'; m.count = 0; mp.countT = 0; set('knockdown'); }
+      else if (m.timer <= 0) {
+        if (m.round >= ROUNDS) {
+          const hostScore = (mp.rs?.taken || 0) + 15 * (mp.rs?.kd || 0);
+          const guestScore = game.stats.taken + 15 * player.knockdowns;
+          m.winner = Math.abs(hostScore - guestScore) < 4 ? 'draw' : hostScore > guestScore ? 'host' : 'guest';
+          m.method = m.winner === 'draw' ? 'DRAW' : 'DECISION';
+          set('over');
+        } else set('rest');
+      }
+      break;
+    case 'knockdown': {
+      mp.countT += dtReal;
+      if (mp.countT >= 1) { mp.countT -= 1; m.count++; }
+      const downMode = m.down === 'host' ? player.mode : rmode;
+      if (downMode === 'fight') set('fight');
+      else if (m.count >= 10) { m.winner = m.down === 'host' ? 'guest' : 'host'; m.method = 'KNOCKOUT'; set('over'); }
+      break;
+    }
+    case 'rest':
+      if (mp.phaseT > 4.5) { m.round++; m.timer = ROUND_TIME; set('intro'); }
+      break;
+    default:
+      break;
+  }
+}
+
+function applyMatch(m) {
+  if (!m || typeof m.phase !== 'string') return;
+  game.round = num(m.round, 1, ROUNDS, 1) | 0;
+  game.timer = num(m.timer, 0, ROUND_TIME, ROUND_TIME);
+  const key = `${m.phase}:${m.epoch}`;
+  if (key !== mp.applied) { mp.applied = key; onMatchPhase(m); }
+  if (m.phase === 'knockdown') {
+    const c = num(m.count, 0, 10) | 0;
+    if (c !== mp.shownCount) {
+      mp.shownCount = c;
+      if (game.phase !== 'kocam') $('count').textContent = c > 0 ? c : '';
+      if (c > 0) sfx.tone({ freq: 220, dur: 0.12, gain: 0.15, type: 'square' });
+    }
+  }
+}
+
+function setPhase(p) { if (game.phase !== 'kowait' && game.phase !== 'kocam') game.phase = p; }
+
+function onMatchPhase(m) {
+  switch (m.phase) {
+    case 'intro': {
+      const [x, z, yaw] = myCorner(), [ox, oz, oyaw] = theirCorner();
+      player.resetKeepHealth(x, z, yaw);
+      opp.resetKeepHealth(ox, oz, oyaw);
+      player.mode = 'idle'; opp.mode = 'idle';
+      $('count').textContent = '';
+      setPhase('intro');
+      banner(game.round === ROUNDS ? 'FINAL ROUND' : `ROUND ${game.round}`);
+      break;
+    }
+    case 'fight':
+      if (player.mode === 'idle') player.mode = 'fight';
+      if (opp.mode === 'idle') opp.mode = 'fight';
+      $('count').textContent = '';
+      if (game.phase === 'intro') { sfx.bell(1); banner('FIGHT!'); }
+      setPhase('fight');
+      break;
+    case 'knockdown':
+      mp.shownCount = -1;
+      setPhase('knockdown');
+      break;
+    case 'rest':
+      sfx.bell(2);
+      if (player.mode === 'fight') player.mode = 'idle';
+      player.health = Math.min(100, player.health + 20); player.stamina = 100;
+      banner(`END OF ROUND ${game.round}`);
+      setPhase('rest');
+      break;
+    case 'over': {
+      if (game.phase === 'kocam') endKoCam();
+      const w = m.winner;
+      finish(w === 'draw' ? null : w === mp.role, typeof m.method === 'string' ? m.method.slice(0, 12) : 'DECISION');
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function beginOnlineMatch() {
+  mp.started = true;
+  sfx.init();
+  for (const id of ['lobby', 'waiting', 'menu', 'results']) $(id).classList.add('hidden');
+  $('hud').classList.remove('hidden');
+  setGlovesVisible(true);
+  game.stats = newStats();
+  game.lagP = game.lagO = 100;
+  game.counterUntil = -1;
+  opp.remote = remoteBody;
+  opp.diff = MP_DIFF;
+  mp.lastConfirm = Math.max(0, ...(mp.rs?.hit || []).map(hitSeqOf));   // ignore reports from before this match
+  const [x, z, yaw] = myCorner(), [ox, oz, oyaw] = theirCorner();
+  player.reset(x, z, yaw);
+  opp.reset(ox, oz, oyaw);
+  opp.knockdowns = 0;
+  game.phase = 'intro';
+  $('opp-name').textContent = mp.rs?.name || 'Opponent';
+  net.setListed(false);
+  overlay('MATCH FOUND', `You're fighting ${mp.rs?.name || 'your opponent'}. Click to start.`, 'FIGHT');
+}
+
+function mpUpdate(dt, dtReal, now) {
+  const others = net.others();
+  let rp = null;
+  if (mp.role === 'host') {
+    if (mp.peer) rp = others.find((p) => p.peer === mp.peer) || null;
+    if (!rp && !mp.started) {
+      rp = others.find((p) => p.presence?.role === 'guest' && Array.isArray(p.presence.s)) || null;
+      if (rp) mp.peer = rp.peer;
+    }
+  } else {
+    rp = others.find((p) => p.presence?.role === 'host') || null;
+  }
+  if (rp && readRemote(rp)) mp.lastSeen = now;
+
+  if (!mp.started) {
+    if (mp.role === 'guest') {
+      const me = net.myPeer();
+      if (rp && mp.rs?.opp && me && mp.rs.opp !== me) { lobbyError('That match already has two fighters.'); return; }
+      if (rp && me && mp.rs?.opp === me && mp.rs.m && mp.rs.m.phase !== 'waiting') beginOnlineMatch();
+      else if (!rp && now - mp.joinT > 8000) { lobbyError(`No open match found with code ${net.code}.`); return; }
+    } else {
+      hostTick(dt, dtReal);
+      if (mp.m.phase !== 'waiting') beginOnlineMatch();
+    }
+  } else {
+    if (now - mp.lastSeen > 4000 && game.phase !== 'over') { opponentLeft(); return; }
+    if (mp.rs) { syncRemoteMode(); readConfirms(mp.rs.hit); }
+    if (mp.role === 'host') hostTick(dt, dtReal);
+    applyMatch(mp.role === 'host' ? mp.m : mp.rs?.m);
+    // getting up: mash Space, allowed from the count of 3
+    if (player.mode === 'down') {
+      $('recover').classList.remove('hidden');
+      player.recover = Math.max(0, player.recover - dtReal * 0.15);
+      $('recover-fill').style.width = `${Math.min(100, player.recover * 100)}%`;
+      const count = num((mp.role === 'host' ? mp.m : mp.rs?.m)?.count, 0, 10);
+      if (player.recover >= 1 && count >= 3 && player.knockdowns < 3) {
+        player.rise(Math.max(25, 60 - player.knockdowns * 12));
+        $('recover').classList.add('hidden');
+      }
+    }
+  }
+  // While the replay is on screen the bodies hold replayed poses, so only the match clock is sent.
+  if (game.phase === 'kocam') { if (mp.role === 'host') net.send({ m: mp.m }, now); }
+  else net.send(myState(), now);
+}
+
+function opponentLeft() {
+  banner('OPPONENT LEFT');
+  finish(true, 'FORFEIT');
+}
+
+// ---- lobby UI
+function savedName() { try { return localStorage.getItem('km-name') || ''; } catch { return ''; } }
+function rememberName(n) { try { localStorage.setItem('km-name', n); } catch { /* private window */ } }
+
+async function openLobby() {
+  $('menu').classList.add('hidden');
+  $('results').classList.add('hidden');
+  $('lobby').classList.remove('hidden');
+  $('nick').value = $('nick').value || savedName();
+  lobbyStatus('Connecting…');
+  if (!net.available) await net.init();
+  const ok = net.available;
+  for (const id of ['host-btn', 'join-btn', 'code-input']) $(id).disabled = !ok;
+  if (!ok) {
+    lobbyStatus('Online play works on the hosted page on claude.ai. Open it there, signed in, and share it with whoever you want to fight.');
+    renderLobby([]);
+    return;
+  }
+  lobbyStatus('Host a match, or join one that someone else is hosting. Anyone you share this page with can see open matches while they have it open.');
+  renderLobby(net.openMatches());
+}
+
+function lobbyStatus(text) { $('lobby-status').textContent = text; }
+
+let lobbyKey = null;
+function renderLobby(list) {
+  // Only redraw when the list really changes, so a JOIN button isn't replaced under the cursor.
+  const key = (net.available ? 'y' : 'n') + JSON.stringify((list || []).map((m) => [m.code, m.name]));
+  if (key === lobbyKey) return;
+  lobbyKey = key;
+  const el = $('match-list');
+  el.textContent = '';
+  if (!list || !list.length) {
+    const p = document.createElement('div');
+    p.className = 'empty';
+    p.textContent = net.available ? 'No open matches right now.' : 'Online play is not available here.';
+    el.append(p);
+    return;
+  }
+  for (const m of list) {
+    const row = document.createElement('div');
+    row.className = 'match-row';
+    const n = document.createElement('span'); n.textContent = m.name;
+    const c = document.createElement('code'); c.textContent = m.code;
+    const b = document.createElement('button'); b.textContent = 'JOIN'; b.addEventListener('click', () => joinMatch(m.code));
+    row.append(n, c, b);
+    el.append(row);
+  }
+}
+net.onLobby = (list) => { if (!$('lobby').classList.contains('hidden')) renderLobby(list || []); };
+
+function playerName() {
+  const n = cleanName($('nick').value);
+  rememberName(n);
+  return n;
+}
+
+async function hostMatch() {
+  try {
+    resetMp('host');
+    const code = await net.host(playerName());
+    $('lobby').classList.add('hidden');
+    $('wait-code').textContent = code.toUpperCase();
+    $('waiting').classList.remove('hidden');
+  } catch {
+    resetMp(null);
+    lobbyStatus('Could not open a match right now. Try again in a moment.');
+  }
+}
+
+async function joinMatch(code) {
+  try {
+    lobbyStatus(`Joining ${String(code).toUpperCase()}…`);
+    resetMp('guest');
+    await net.join(code, playerName());
+    mp.joinT = performance.now();
+  } catch (e) {
+    resetMp(null);
+    lobbyStatus(e?.message === 'bad_code' ? 'Match codes are 4 to 8 letters and numbers.' : 'Could not join that match. Check the code and try again.');
+  }
+}
+
+function lobbyError(msg) {
+  net.leave();
+  resetMp(null);
+  $('waiting').classList.add('hidden');
+  openLobby().then(() => lobbyStatus(msg));
+}
+
+async function mpLeave(toLobby = false) {
+  await net.leave();
+  resetMp(null);
+  opp.remote = null;
+  opp.setDifficulty(game.difficulty);
+  $('opp-name').textContent = '"THE BRICK"';
+  setOverlay(false);
+  $('waiting').classList.add('hidden');
+  toMenu();
+  if (toLobby) openLobby();
 }
 
 // ---------------------------------------------------------------- incoming punch warning
 const THREAT_DIR = { jab: 't', cross: 't', hookL: 'r', hookR: 'l', bodyR: 'b', upperR: 'b' };
 const THREAT_HINT = {
-  jab: 'SLIP  ⇧A / ⇧D', cross: 'SLIP  ⇧A / ⇧D', hookL: 'DUCK  C  ·  PULL BACK  ⇧S', hookR: 'DUCK  C  ·  PULL BACK  ⇧S',
-  bodyR: 'BLOCK  SPACE', upperR: 'PULL BACK  ⇧S',
+  jab: 'SLIP  ⇧ + CLICK', cross: 'SLIP  ⇧ + CLICK', hookL: 'DUCK  C', hookR: 'DUCK  C',
+  bodyR: 'BLOCK  SPACE', upperR: 'SLIP  ⇧ + CLICK',
 };
 const threatEls = { t: null, l: null, r: null, b: null };
 function updateThreat() {
@@ -545,27 +1002,47 @@ document.addEventListener('pointerlockchange', () => {
 document.addEventListener('pointerlockerror', () => { game.noLock = true; });
 
 function setPaused(p) {
+  if (mp.on) { if (p) overlay('MENU', 'The fight keeps going while this is open.', 'RESUME'); else setOverlay(false); return; }
   game.paused = p;
-  $('pause').classList.toggle('hidden', !p);
-  if (p) player.keys.clear();
+  if (p) overlay('PAUSED', 'Leaving ends the fight and returns to the menu.', 'RESUME', true);
+  else setOverlay(false);
 }
 
-$('resume').addEventListener('click', () => { setPaused(false); lockPointer(); });
-$('leave').addEventListener('click', () => { setPaused(false); toMenu(); });
+/** The pause panel doubles as the online "click to start" / menu panel. */
+function overlay(title, note, resumeText, pausing = false) {
+  $('pause-title').textContent = title;
+  $('pause-note').textContent = note;
+  $('resume').textContent = resumeText;
+  game.overlay = !pausing;
+  $('pause').classList.remove('hidden');
+  player.keys.clear();
+}
+function setOverlay(v) {
+  game.overlay = false;
+  game.paused = game.paused && v;
+  if (!v) $('pause').classList.add('hidden');
+}
+
+$('resume').addEventListener('click', () => { game.paused = false; setOverlay(false); lockPointer(); });
+$('leave').addEventListener('click', () => { game.paused = false; setOverlay(false); if (mp.on) mpLeave(); else toMenu(); });
 
 document.addEventListener('mousemove', (e) => {
-  if (!inMatch() || game.paused) return;
+  if (!inMatch() || game.paused || game.overlay) return;
   if (!document.pointerLockElement && !game.noLock) return;
   player.look(e.movementX || 0, e.movementY || 0);
 });
 
 canvas.addEventListener('mousedown', (e) => {
-  if (!inMatch() || game.paused) return;
+  if (!inMatch() || game.paused || game.overlay) return;
   if (game.phase === 'kocam') { ko.skip = true; return; }
   if (!document.pointerLockElement && !game.noLock) { lockPointer(); return; }
-  const type = e.shiftKey ? 'uppercut' : 'straight';
-  if (e.button === 0) player.requestPunch(0, type);
-  if (e.button === 2) player.requestPunch(1, type);
+  if (e.shiftKey) {   // Shift + left/right click: slip your head that way
+    if (e.button === 0) player.requestDodge('left');
+    if (e.button === 2) player.requestDodge('right');
+    return;
+  }
+  if (e.button === 0) player.requestPunch(0, 'straight');
+  if (e.button === 2) player.requestPunch(1, 'straight');
 });
 window.addEventListener('contextmenu', (e) => e.preventDefault());
 
@@ -573,7 +1050,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
   if (e.code === 'KeyV') debugView.toggle();
   if (e.code === 'KeyM') sfx.toggleMute();
-  if (!inMatch() || game.paused) return;
+  if (!inMatch() || game.paused || game.overlay) return;
   if (e.repeat) return;
   player.keys.add(e.code);
   if (e.code === 'KeyP') { setPaused(true); return; }
@@ -583,12 +1060,9 @@ window.addEventListener('keydown', (e) => {
   }
   if (e.code === 'KeyQ') player.requestPunch(0, e.shiftKey ? 'bodyhook' : 'hook');
   if (e.code === 'KeyE') player.requestPunch(1, e.shiftKey ? 'bodyhook' : 'hook');
-  if (e.shiftKey) {
-    if (e.code === 'KeyA') player.requestDodge('left');
-    if (e.code === 'KeyD') player.requestDodge('right');
-    if (e.code === 'KeyS') player.requestDodge('back');
-  }
-  if (e.code === 'Space' && game.phase === 'knockdown' && player.mode === 'down' && player.knockdowns < 3) {
+  if (e.code === 'KeyZ') player.requestPunch(0, 'uppercut');
+  if (e.code === 'KeyX') player.requestPunch(1, 'uppercut');
+  if (e.code === 'Space' && player.mode === 'down' && player.knockdowns < 3) {
     player.recover += 0.085;
   }
 });
@@ -600,10 +1074,21 @@ document.querySelectorAll('[data-diff]').forEach((b) => b.addEventListener('clic
   document.querySelectorAll('[data-diff]').forEach((o) => o.classList.toggle('sel', o === b));
 }));
 $('start').addEventListener('click', startMatch);
-$('again').addEventListener('click', startMatch);
-$('to-menu').addEventListener('click', toMenu);
+$('again').addEventListener('click', () => (mp.on ? mpLeave(true) : startMatch()));
+$('to-menu').addEventListener('click', () => (mp.on ? mpLeave() : toMenu()));
+$('online-btn').addEventListener('click', openLobby);
+$('lobby-back').addEventListener('click', () => { $('lobby').classList.add('hidden'); $('menu').classList.remove('hidden'); });
+$('host-btn').addEventListener('click', hostMatch);
+$('join-btn').addEventListener('click', () => joinMatch($('code-input').value));
+$('code-input').addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') joinMatch($('code-input').value); });
+$('nick').addEventListener('keydown', (e) => e.stopPropagation());
+$('cancel-host').addEventListener('click', () => mpLeave(true));
 
-player.onPunch = (g, type) => { game.stats.thrown++; opp.notifyIncoming(game.time, type === 'bodyhook'); };
+player.onPunch = (g, type) => {
+  game.stats.thrown++;
+  if (mp.on) mp.names.set(g.punch.seq, punchName(g, type));
+  else opp.notifyIncoming(game.time, type === 'bodyhook');
+};
 player.onSwing = () => sfx.whoosh(0.5);
 opp.onSwing = () => { sfx.whoosh(0.3); game.stats.oppThrown++; };
 player.onDodge = () => sfx.whoosh(0.45);
@@ -629,6 +1114,10 @@ window.addEventListener('resize', () => {
 
 // ---------------------------------------------------------------- loop
 function updatePhase(dt, dtReal) {
+  if (mp.on) {
+    if (game.phase === 'kowait' && game.time >= ko.hitTime + KO_AFTER) startKoCam();
+    return;
+  }
   switch (game.phase) {
     case 'intro':
       game.phaseT += dtReal;
@@ -671,7 +1160,8 @@ let acc = 0;
 renderer.setAnimationLoop((now) => {
   const dtReal = Math.min(0.05, (now - last) / 1000);
   last = now;
-  if (game.paused) { renderer.render(scene, camera); return; }
+  if (game.paused && !mp.on) { renderer.render(scene, camera); return; }
+  if (mp.on) mpUpdate(dtReal, dtReal, now);
   if (game.phase === 'kocam') {
     updateKoCam(dtReal);
     arena.updateCrowd(dtReal);
@@ -693,6 +1183,7 @@ renderer.setAnimationLoop((now) => {
   while (acc >= STEP && n < MAX_STEPS) { substep(STEP); acc -= STEP; n++; }
   if (n === MAX_STEPS) acc = 0;
 
+  player.avatar.tick(dt);
   if (game.phase !== 'menu') recordFrame();
   arena.updateRopes();
   arena.updateCrowd(dtReal);
@@ -714,4 +1205,4 @@ renderer.setAnimationLoop((now) => {
 });
 
 // handy for tinkering from the console
-window.game = { game, player, opp, world, arena, startMatch, oppKnockdown };
+window.game = { game, player, opp, world, arena, startMatch, oppKnockdown, mp, net };
