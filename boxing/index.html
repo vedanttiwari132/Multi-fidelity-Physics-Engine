@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Knockout Physics</title>
+  <style>
+    :root { --blue: #3b82ff; --red: #ff3b3b; --gold: #ffd166; --ink: #f4f1ea; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #07080c; color: var(--ink);
+      font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif; user-select: none; }
+    #app canvas { display: block; }
+    .hidden { display: none !important; }
+
+    #vignette { position: fixed; inset: 0; pointer-events: none; opacity: 0;
+      background: radial-gradient(ellipse at center, rgba(0,0,0,0) 45%, rgba(170,0,0,0.85) 100%); }
+
+    #hud { position: fixed; inset: 0; pointer-events: none; }
+    .top { position: absolute; top: 16px; left: 24px; right: 24px; display: flex; align-items: flex-start; gap: 24px; }
+    .fighter { flex: 1; }
+    .fighter.right { text-align: right; }
+    .name { font-weight: 800; letter-spacing: 0.12em; font-size: 14px; margin-bottom: 6px; text-shadow: 0 2px 4px #000; }
+    .bar { position: relative; height: 18px; background: rgba(0,0,0,0.55); border: 2px solid rgba(255,255,255,0.7);
+      border-radius: 3px; overflow: hidden; transform: skewX(-12deg); }
+    .fighter.right .bar { transform: skewX(12deg); }
+    .fill, .lag { position: absolute; top: 0; bottom: 0; left: 0; width: 100%; }
+    .fighter.right .fill, .fighter.right .lag { left: auto; right: 0; }
+    .lag { background: #fff; opacity: 0.75; z-index: 0; }
+    .fill { z-index: 1; transition: width 0.08s linear; }
+    .fill.blue { background: linear-gradient(#6aa2ff, #1d5bd8); }
+    .fill.red { background: linear-gradient(#ff7272, #c81818); }
+    .fill.green { background: linear-gradient(#8ef08e, #29a329); }
+    .kd { margin-top: 6px; font-size: 12px; letter-spacing: 0.1em; color: var(--gold); min-height: 16px; text-shadow: 0 1px 3px #000; }
+    .clock { text-align: center; min-width: 140px; background: rgba(0,0,0,0.55); border: 2px solid rgba(255,255,255,0.5);
+      border-radius: 6px; padding: 4px 14px 6px; }
+    #round { font-size: 12px; letter-spacing: 0.2em; opacity: 0.85; }
+    #timer { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; }
+
+    #crosshair { position: absolute; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px;
+      border-radius: 50%; background: rgba(255,255,255,0.7); box-shadow: 0 0 4px #000; }
+    #impact { position: absolute; left: 50%; top: 40%; transform: translate(-50%, -50%); text-align: center;
+      font-weight: 800; text-shadow: 0 2px 6px #000; opacity: 0; }
+    #impact .label { font-size: 28px; letter-spacing: 0.08em; }
+    #impact .phys { font-size: 15px; color: var(--gold); font-variant-numeric: tabular-nums; }
+    #impact.show { animation: pop 0.9s ease-out forwards; }
+    @keyframes pop { 0% { opacity: 1; transform: translate(-50%, -50%) scale(1.35); }
+      15% { transform: translate(-50%, -50%) scale(1); } 70% { opacity: 1; } 100% { opacity: 0; transform: translate(-50%, -80%); } }
+
+    #banner { position: absolute; left: 0; right: 0; top: 28%; text-align: center; font-size: 72px; font-weight: 900;
+      letter-spacing: 0.08em; font-style: italic; text-shadow: 0 4px 0 #000, 0 0 30px rgba(255,80,40,0.6); opacity: 0; }
+    #banner.show { animation: banner 1.6s ease-out forwards; }
+    @keyframes banner { 0% { opacity: 0; transform: scale(2); } 12% { opacity: 1; transform: scale(1); } 75% { opacity: 1; } 100% { opacity: 0; } }
+    #count { position: absolute; left: 0; right: 0; top: 42%; text-align: center; font-size: 120px; font-weight: 900;
+      color: var(--gold); text-shadow: 0 6px 0 #000; }
+    #recover { position: absolute; left: 50%; bottom: 22%; transform: translateX(-50%); width: 340px; text-align: center;
+      font-weight: 800; letter-spacing: 0.12em; }
+    #recover .bar { margin-top: 8px; transform: none; }
+    #recover-fill { position: absolute; inset: 0; width: 0%; background: linear-gradient(#ffe48a, #e0a400); }
+
+    .bottom { position: absolute; bottom: 22px; left: 50%; transform: translateX(-50%); width: 300px; text-align: center; }
+    .bottom .label { font-size: 11px; letter-spacing: 0.25em; margin-bottom: 4px; opacity: 0.85; }
+    .bar.small { height: 10px; transform: none; }
+    #hint { position: absolute; left: 16px; bottom: 14px; font-size: 12px; opacity: 0.55; line-height: 1.5; }
+    #debug-info { position: absolute; right: 16px; bottom: 14px; font: 12px ui-monospace, Menlo, monospace; color: #40ff90; text-align: right; }
+
+    .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: radial-gradient(ellipse at center, rgba(10,12,20,0.55), rgba(0,0,0,0.88)); }
+    .panel { max-width: 640px; width: calc(100% - 32px); padding: 32px 36px; background: rgba(12,14,22,0.85);
+      border: 1px solid rgba(255,255,255,0.15); border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,0.6); text-align: center; }
+    h1 { margin: 0; font-size: 56px; font-weight: 900; font-style: italic; letter-spacing: 0.04em; line-height: 1; }
+    h1 span { display: block; font-size: 26px; color: var(--red); letter-spacing: 0.5em; margin-top: 6px; font-style: normal; }
+    h2 { margin: 0 0 8px; font-size: 44px; font-style: italic; font-weight: 900; }
+    .tag { opacity: 0.8; line-height: 1.5; margin: 18px 0 22px; }
+    .diff { display: flex; gap: 10px; justify-content: center; margin-bottom: 18px; }
+    button { pointer-events: auto; cursor: pointer; font: inherit; color: var(--ink); background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.25); padding: 8px 18px; border-radius: 8px; font-weight: 700; letter-spacing: 0.08em; }
+    button:hover { background: rgba(255,255,255,0.16); }
+    button.sel { background: var(--red); border-color: var(--red); }
+    button.big { font-size: 22px; padding: 12px 48px; background: var(--red); border-color: var(--red); margin: 4px 6px; }
+    .controls { display: grid; grid-template-columns: auto auto; gap: 6px 18px; margin: 24px auto 0; text-align: left;
+      font-size: 14px; width: max-content; max-width: 100%; }
+    .controls kbd { display: inline-block; min-width: 20px; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.25); font: 12px ui-monospace, Menlo, monospace; text-align: center; }
+    .controls .k { text-align: right; opacity: 0.95; }
+    .controls .d { opacity: 0.75; }
+    #res-stats { display: grid; grid-template-columns: 1fr auto; gap: 4px 24px; margin: 18px auto 22px; width: max-content; text-align: left; }
+    #res-stats div:nth-child(even) { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .small-note { font-size: 12px; opacity: 0.5; margin-top: 18px; }
+  </style>
+  <script type="importmap">{ "imports": { "three": "./vendor/three.module.min.js" } }</script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="vignette"></div>
+
+  <div id="hud" class="hidden">
+    <div class="top">
+      <div class="fighter left">
+        <div class="name">YOU</div>
+        <div class="bar"><div id="p-lag" class="lag"></div><div id="p-health" class="fill blue"></div></div>
+        <div id="p-kd" class="kd"></div>
+      </div>
+      <div class="clock"><div id="round">ROUND 1</div><div id="timer">1:30</div></div>
+      <div class="fighter right">
+        <div class="name">"THE BRICK"</div>
+        <div class="bar"><div id="o-lag" class="lag"></div><div id="o-health" class="fill red"></div></div>
+        <div id="o-kd" class="kd"></div>
+      </div>
+    </div>
+    <div id="crosshair"></div>
+    <div id="impact"><div class="label"></div><div class="phys"></div></div>
+    <div id="banner"></div>
+    <div id="count"></div>
+    <div id="recover" class="hidden"><div id="recover-text">MASH SPACE TO GET UP</div><div class="bar"><div id="recover-fill"></div></div></div>
+    <div class="bottom"><div class="label">STAMINA</div><div class="bar small"><div id="stamina" class="fill green"></div></div></div>
+    <div id="hint">LMB / RMB jab · cross &nbsp;|&nbsp; Q / E hooks &nbsp;|&nbsp; Shift+click uppercut<br>Space guard · C duck · WASD move · V physics view · M mute</div>
+    <div id="debug-info"></div>
+  </div>
+
+  <div id="menu" class="overlay">
+    <div class="panel">
+      <h1>KNOCKOUT<span>PHYSICS</span></h1>
+      <p class="tag">First-person, physics-driven boxing. Your gloves and your opponent are simulated bodies —
+        every punch is a real collision, so <b>speed, range, timing and footwork</b> decide the damage.</p>
+      <div class="diff">
+        <button data-diff="easy">EASY</button>
+        <button data-diff="normal" class="sel">NORMAL</button>
+        <button data-diff="hard">HARD</button>
+      </div>
+      <button id="start" class="big">FIGHT</button>
+      <div class="controls">
+        <div class="k"><kbd>Mouse</kbd></div><div class="d">Look / aim your punches</div>
+        <div class="k"><kbd>LMB</kbd> <kbd>RMB</kbd></div><div class="d">Left jab · right cross</div>
+        <div class="k"><kbd>Q</kbd> <kbd>E</kbd></div><div class="d">Left hook · right hook</div>
+        <div class="k"><kbd>Shift</kbd>+click</div><div class="d">Uppercut</div>
+        <div class="k"><kbd>Space</kbd> (hold)</div><div class="d">Guard — your gloves physically block</div>
+        <div class="k"><kbd>C</kbd> (hold)</div><div class="d">Duck under punches</div>
+        <div class="k"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div><div class="d">Footwork (stepping in adds power)</div>
+        <div class="k"><kbd>V</kbd></div><div class="d">Toggle physics debug view</div>
+      </div>
+      <div class="small-note">3 rounds × 90 s · three knockdowns ends it · Esc to pause</div>
+    </div>
+  </div>
+
+  <div id="pause" class="overlay hidden">
+    <div class="panel"><h2>PAUSED</h2><p>Click to resume</p></div>
+  </div>
+
+  <div id="results" class="overlay hidden">
+    <div class="panel">
+      <h2 id="res-title">YOU WIN</h2>
+      <div id="res-detail"></div>
+      <div id="res-stats"></div>
+      <button id="again" class="big">REMATCH</button>
+      <button id="to-menu">MENU</button>
+    </div>
+  </div>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
