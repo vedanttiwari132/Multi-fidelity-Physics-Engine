@@ -85,6 +85,35 @@
     .controls .d { opacity: 0.75; }
     #res-stats { display: grid; grid-template-columns: 1fr auto; gap: 4px 24px; margin: 18px auto 22px; width: max-content; text-align: left; }
     #res-stats div:nth-child(even) { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+    #threat { position: absolute; left: 50%; top: 50%; width: 190px; height: 190px; margin: -95px 0 0 -95px;
+      opacity: 0; transition: opacity 0.08s; --urgency: 0; }
+    #threat.on { opacity: 1; }
+    #threat .arc { position: absolute; inset: 0; border-radius: 50%; border: 7px solid transparent; opacity: 0.12; }
+    #threat .arc.t { border-top-color: #fff; } #threat .arc.b { border-bottom-color: #fff; }
+    #threat .arc.l { border-left-color: #fff; } #threat .arc.r { border-right-color: #fff; }
+    #threat .arc.lit { opacity: 1; border-width: calc(6px + 8px * var(--urgency));
+      filter: drop-shadow(0 0 calc(4px + 14px * var(--urgency)) #ff4020); animation: threat 0.18s ease-in-out infinite alternate; }
+    #threat .arc.t.lit { border-top-color: #ff5a2a; } #threat .arc.b.lit { border-bottom-color: #ffb020; }
+    #threat .arc.l.lit { border-left-color: #ff5a2a; } #threat .arc.r.lit { border-right-color: #ff5a2a; }
+    @keyframes threat { to { transform: scale(0.94); } }
+    #threat-text { position: absolute; top: calc(100% + 10px); left: 50%; transform: translateX(-50%); white-space: nowrap;
+      text-align: center; text-shadow: 0 2px 4px #000; }
+    #threat-label { font-weight: 900; font-size: 18px; letter-spacing: 0.12em; color: #ff7a50; }
+    #threat-hint { font-size: 12px; letter-spacing: 0.14em; opacity: 0.9; margin-top: 2px; }
+
+    #kocam { position: fixed; inset: 0; pointer-events: none; }
+    #kocam .lb { position: absolute; left: 0; right: 0; height: 12vh; background: #000; }
+    #kocam .lb-top { top: 0; } #kocam .lb-bottom { bottom: 0; }
+    .kc-tag { position: absolute; top: 4vh; left: 28px; color: #ff3b3b; font-weight: 800; letter-spacing: 0.2em; font-size: 14px;
+      animation: blink 1s steps(2) infinite; }
+    @keyframes blink { 50% { opacity: 0.2; } }
+    .kc-title { position: absolute; top: 3vh; left: 0; right: 0; text-align: center; font-size: 34px; font-weight: 900;
+      font-style: italic; letter-spacing: 0.12em; }
+    #kc-caption { position: absolute; bottom: 4vh; left: 0; right: 0; text-align: center; font-size: 20px; font-weight: 800;
+      color: var(--gold); letter-spacing: 0.08em; opacity: 0; transition: opacity 0.3s; }
+    #kc-caption.show { opacity: 1; }
+    .kc-skip { position: absolute; bottom: 4.5vh; right: 28px; font-size: 12px; opacity: 0.5; letter-spacing: 0.1em; }
+
     .small-note { font-size: 12px; opacity: 0.5; margin-top: 18px; }
   </style>
   <script type="importmap">{ "imports": { "three": "./vendor/three.module.min.js" } }</script>
@@ -108,20 +137,30 @@
       </div>
     </div>
     <div id="crosshair"></div>
+    <div id="threat"><div class="arc t"></div><div class="arc l"></div><div class="arc r"></div><div class="arc b"></div>
+      <div id="threat-text"><div id="threat-label"></div><div id="threat-hint"></div></div></div>
     <div id="impact"><div class="label"></div><div class="phys"></div></div>
     <div id="banner"></div>
     <div id="count"></div>
     <div id="recover" class="hidden"><div id="recover-text">MASH SPACE TO GET UP</div><div class="bar"><div id="recover-fill"></div></div></div>
     <div class="bottom"><div class="label">STAMINA</div><div class="bar small"><div id="stamina" class="fill green"></div></div></div>
-    <div id="hint">LMB / RMB jab · cross &nbsp;|&nbsp; Q / E hooks &nbsp;|&nbsp; Shift+click uppercut<br>Space guard · C duck · WASD move · V physics view · M mute</div>
+    <div id="hint">LMB / RMB jab · cross &nbsp;|&nbsp; Q / E hooks &nbsp;|&nbsp; Shift+Q / E body hooks &nbsp;|&nbsp; Shift+click uppercut<br>Space guard · C duck · Shift+A / D slip · Shift+S pull back · WASD move · V physics view · M mute</div>
     <div id="debug-info"></div>
+  </div>
+
+  <div id="kocam" class="hidden">
+    <div class="lb lb-top"></div><div class="lb lb-bottom"></div>
+    <div class="kc-tag">● REPLAY</div>
+    <div class="kc-title">KNOCKOUT CAM</div>
+    <div id="kc-caption"></div>
+    <div class="kc-skip">click or Space to skip</div>
   </div>
 
   <div id="menu" class="overlay">
     <div class="panel">
       <h1>KNOCKOUT<span>PHYSICS</span></h1>
-      <p class="tag">First-person, physics-driven boxing. Your gloves and your opponent are simulated bodies —
-        every punch is a real collision, so <b>speed, range, timing and footwork</b> decide the damage.</p>
+      <p class="tag">First-person, physics-driven boxing. Every punch is a real collision, so <b>speed, range and timing</b> decide the damage.
+        The glove he's about to throw glows, and the ring around your sights shows where it's coming from. Slip it and he's open for a counter.</p>
       <div class="diff">
         <button data-diff="easy">EASY</button>
         <button data-diff="normal" class="sel">NORMAL</button>
@@ -132,18 +171,24 @@
         <div class="k"><kbd>Mouse</kbd></div><div class="d">Look / aim your punches</div>
         <div class="k"><kbd>LMB</kbd> <kbd>RMB</kbd></div><div class="d">Left jab · right cross</div>
         <div class="k"><kbd>Q</kbd> <kbd>E</kbd></div><div class="d">Left hook · right hook</div>
+        <div class="k"><kbd>Shift</kbd>+<kbd>Q</kbd> <kbd>E</kbd></div><div class="d">Left · right body hook</div>
         <div class="k"><kbd>Shift</kbd>+click</div><div class="d">Uppercut</div>
-        <div class="k"><kbd>Space</kbd> (hold)</div><div class="d">Guard — your gloves physically block</div>
+        <div class="k"><kbd>Space</kbd> (hold)</div><div class="d">Guard: stops clean shots, but drains stamina</div>
+        <div class="k"><kbd>Shift</kbd>+<kbd>A</kbd> <kbd>D</kbd></div><div class="d">Slip left · right</div>
+        <div class="k"><kbd>Shift</kbd>+<kbd>S</kbd></div><div class="d">Pull back</div>
         <div class="k"><kbd>C</kbd> (hold)</div><div class="d">Duck under punches</div>
         <div class="k"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div><div class="d">Footwork (stepping in adds power)</div>
         <div class="k"><kbd>V</kbd></div><div class="d">Toggle physics debug view</div>
       </div>
-      <div class="small-note">3 rounds × 90 s · three knockdowns ends it · Esc to pause</div>
+      <div class="small-note">3 rounds × 90 s · three knockdowns ends it · Esc or P to pause or leave the match</div>
     </div>
   </div>
 
   <div id="pause" class="overlay hidden">
-    <div class="panel"><h2>PAUSED</h2><p>Click to resume</p></div>
+    <div class="panel"><h2>PAUSED</h2>
+      <button id="resume" class="big">RESUME</button>
+      <button id="leave">LEAVE MATCH</button>
+      <div class="small-note">Leaving ends the fight and returns to the menu.</div></div>
   </div>
 
   <div id="results" class="overlay hidden">

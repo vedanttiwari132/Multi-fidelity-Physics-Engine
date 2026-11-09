@@ -59,9 +59,9 @@ const REGION = {
 };
 
 export const DIFFICULTY = {
-  easy:   { react: 0.42, block: 0.25, slip: 0.10, aggression: 0.55, telegraph: 0.20, damage: 0.6, power: 0.85, accuracy: 0.09, speed: 1.3 },
-  normal: { react: 0.30, block: 0.42, slip: 0.20, aggression: 0.9, telegraph: 0.13, damage: 0.85, power: 1.0, accuracy: 0.06, speed: 1.6 },
-  hard:   { react: 0.19, block: 0.58, slip: 0.30, aggression: 1.3, telegraph: 0.08, damage: 1.1, power: 1.1, accuracy: 0.035, speed: 1.9 },
+  easy:   { react: 0.42, block: 0.25, slip: 0.10, aggression: 0.55, telegraph: 0.42, damage: 0.6, power: 0.85, accuracy: 0.09, speed: 1.3 },
+  normal: { react: 0.30, block: 0.42, slip: 0.20, aggression: 0.9, telegraph: 0.32, damage: 0.85, power: 1.0, accuracy: 0.06, speed: 1.6 },
+  hard:   { react: 0.19, block: 0.58, slip: 0.30, aggression: 1.3, telegraph: 0.24, damage: 1.1, power: 1.1, accuracy: 0.035, speed: 1.9 },
 };
 
 const PUNCHES = {
@@ -71,6 +71,9 @@ const PUNCHES = {
   hookR:  { side: -1, kind: 'hook', wind: 0.12, ext: 0.2, ret: 0.28, aim: 'head', power: 1.25 },
   bodyR:  { side: -1, kind: 'straight', wind: 0.08, ext: 0.17, ret: 0.26, aim: 'chest', power: 1.0 },
   upperR: { side: -1, kind: 'upper', wind: 0.12, ext: 0.17, ret: 0.28, aim: 'head', power: 1.3 },
+};
+export const PUNCH_LABEL = {
+  jab: 'JAB', cross: 'CROSS', hookL: 'LEFT HOOK', hookR: 'RIGHT HOOK', bodyR: 'BODY SHOT', upperR: 'UPPERCUT',
 };
 const COMBOS = [
   ['jab'], ['jab', 'cross'], ['jab', 'jab', 'cross'], ['cross', 'hookL'], ['jab', 'cross', 'hookL'],
@@ -142,7 +145,7 @@ export class Opponent {
     this.mode = 'idle'; this.tactic = 'stalk'; this.tacticT = 1;
     this.comboQueue = []; this.attackCd = 1.0; this.coverT = 0; this.slipTimer = 0; this.slipDir = 1;
     this.staggerT = 0; this.circleDir = Math.random() < 0.5 ? -1 : 1; this.incoming = null; this.lastPunchAt = -10;
-    this.cover = false;
+    this.cover = false; this.coverLow = false; this.coverLowT = 0; this.winded = 0;
     for (const h of this.handList) h.punch = null;
     this.computeTargets(1 / 240, null);
     for (const name in this.p) {
@@ -256,12 +259,13 @@ export class Opponent {
     hand.pole.set(sd * 0.7, -1, -0.2);
     // guard position (local)
     if (this.cover) _l.set(sd * 0.09, 1.6, 0.24);
+    else if (this.coverLow) _l.set(sd * 0.13, 1.08, 0.22);
     else _l.copy(this.local[hand.name]);
     if (this.mode !== 'fight' && this.mode !== 'idle') _l.set(sd * 0.25, 1.0, 0.1);
     _l.y -= Math.min(1, this.daze) * 0.18;
     _l.x += this.slip; _l.y -= this.crouch; _l.z += this.lean;
     this.toWorld(_l, out);
-    if (this.cover) { hand.omega = 26; hand.maxAcc = 150; }
+    if (this.cover || this.coverLow) { hand.omega = 26; hand.maxAcc = 150; }
 
     const pu = hand.punch;
     if (!pu) return out;
@@ -274,7 +278,7 @@ export class Opponent {
       pu.phase = 'wind';
       if (d.kind === 'hook') { out.addScaledVector(X, sd * 0.16); out.addScaledVector(Z, -0.04); hand.pole.set(sd, 0.3, -0.3); this.twistT = -sd * 0.05; }
       else if (d.kind === 'upper') { out.y -= 0.2; this.crouchT = 0.1; hand.pole.set(sd * 0.5, -1, 0.2); }
-      else { out.addScaledVector(Z, -0.05); out.y -= 0.02; }
+      else { out.addScaledVector(Z, -0.09); out.y -= 0.03; this.twistT = -sd * 0.04; }
     } else if (pu.t < pu.wind + d.ext) {
       if (pu.phase !== 'ext') { pu.phase = 'ext'; this.onSwing?.(this); this.moveVel.addScaledVector(Z, 0.6); }
       const u = (pu.t - pu.wind) / d.ext;
@@ -297,8 +301,11 @@ export class Opponent {
         this.leanT = 0.08; this.crouchT = -0.03;
       }
     } else if (pu.t < pu.wind + d.ext + d.ret) {
-      pu.phase = 'ret';
-      hand.omega = 20;
+      if (pu.phase !== 'ret') {
+        pu.phase = 'ret';
+        if (!pu.hit && !pu.interrupted) this.onWhiff?.(this, hand);
+      }
+      hand.omega = pu.whiffed ? 9 : 20;
       this.leanT = 0; this.twistT = 0; this.crouchT = 0;
     } else {
       hand.punch = null;
@@ -330,14 +337,15 @@ export class Opponent {
   }
 
   // ----- AI (per frame) ----------------------------------------------------
-  notifyIncoming(time) {
+  notifyIncoming(time, low = false) {
     if (this.mode !== 'fight' || this.incoming) return;
-    this.incoming = { at: time + this.diff.react * (0.8 + Math.random() * 0.5) };
+    this.incoming = { at: time + this.diff.react * (0.8 + Math.random() * 0.5), low };
   }
 
   think(dt, ctx) {
     this.daze = Math.max(0, this.daze - dt * 0.22);
-    this.coverT -= dt; this.slipTimer -= dt; this.tacticT -= dt; this.attackCd -= dt; this.staggerT -= dt;
+    this.winded = Math.max(0, (this.winded || 0) - dt * 0.08);
+    this.coverT -= dt; this.coverLowT = (this.coverLowT || 0) - dt; this.slipTimer -= dt; this.tacticT -= dt; this.attackCd -= dt; this.staggerT -= dt;
 
     if (this.mode === 'down') this.tone = Math.max(0, this.tone - dt * 5);
     else if (this.mode === 'rising') {
@@ -350,6 +358,7 @@ export class Opponent {
     const ux = dx / dist, uz = dz / dist;
     this.desiredVel.set(0, 0, 0);
     this.cover = this.coverT > 0;
+    this.coverLow = this.coverLowT > 0;
     this.slipT = this.slipTimer > 0 ? this.slipDir * 0.16 : 0;
     if (!this.handList.some((h) => h.punch)) {
       this.leanT = 0; this.twistT = 0; this.crouchT = this.slipTimer > 0 ? 0.07 : 0;
@@ -368,13 +377,13 @@ export class Opponent {
     // defensive reaction to the player's punches
     if (this.incoming && ctx.time >= this.incoming.at) {
       const r = Math.random();
-      if (r < this.diff.block) this.coverT = 0.55;
+      if (r < this.diff.block) { if (this.incoming.low) this.coverLowT = 0.55; else this.coverT = 0.55; }
       else if (r < this.diff.block + this.diff.slip) { this.slipTimer = 0.35; this.slipDir = Math.random() < 0.5 ? -1 : 1; }
       this.incoming = null;
     }
 
     const dazed = this.daze > 0.6;
-    const speed = this.diff.speed * (dazed ? 0.5 : 1);
+    const speed = this.diff.speed * (dazed ? 0.5 : 1) * (1 - 0.4 * (this.winded || 0));
     const range = 0.96;
     const px = -uz, pz = ux;
     let radial = 0, lateral = 0;
@@ -420,7 +429,7 @@ export class Opponent {
     const tgt = def.aim === 'head' ? ctx.playerHead : ctx.playerChest;
     const a = this.diff.accuracy;
     const aim = tgt.clone().add(new THREE.Vector3((Math.random() - 0.5) * 2 * a, (Math.random() - 0.5) * 2 * a, (Math.random() - 0.5) * 2 * a));
-    hand.punch = { def, name, t: 0, wind: def.wind + this.diff.telegraph, aim, phase: 'wind', hit: false };
+    hand.punch = { def, name, t: 0, wind: def.wind + this.diff.telegraph * (name === 'jab' ? 0.8 : 1), aim, phase: 'wind', hit: false };
     this.lastPunchAt = ctx.time;
     return true;
   }
@@ -430,8 +439,9 @@ export class Opponent {
   takeHit(dmg, region) {
     this.health = Math.max(0, this.health - dmg);
     if (region === 'head') this.daze += dmg * 0.035;
+    else this.winded = Math.min(1, (this.winded || 0) + dmg * 0.05);
     if (dmg > 5) {
-      for (const h of this.handList) if (h.punch && h.punch.phase !== 'ret') h.punch.t = h.punch.wind + h.punch.def.ext;
+      for (const h of this.handList) if (h.punch && h.punch.phase !== 'ret') { h.punch.interrupted = true; h.punch.t = h.punch.wind + h.punch.def.ext; }
       this.comboQueue = [];
       this.staggerT = 0.12 + dmg * 0.015;
       if (Math.random() < 0.5) this.coverT = 0.6;
@@ -529,11 +539,12 @@ class FighterView {
     this.gloves = [];
     for (const side of ['L', 'R']) {
       const g = new THREE.Group(); this.group.add(g);
-      const body = add(sphere, glove, g); body.scale.set(0.1, 0.095, 0.125);
-      const thumb = add(sphere, glove, g); thumb.scale.set(0.035, 0.04, 0.06);
+      const mat = glove.clone();
+      const body = add(sphere, mat, g); body.scale.set(0.1, 0.095, 0.125);
+      const thumb = add(sphere, mat, g); thumb.scale.set(0.035, 0.04, 0.06);
       thumb.position.set(side === 'L' ? -0.07 : 0.07, 0.04, 0.02);
       const cuff = add(cyl, trim, g); cuff.scale.set(0.07, 0.09, 0.07); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.12;
-      this.gloves.push({ g, hand: f.p['hand' + side], elbow: f.p['elbow' + side] });
+      this.gloves.push({ g, mat, handState: f.hands[side], hand: f.p['hand' + side], elbow: f.p['elbow' + side] });
     }
     this.shoes = [];
     for (const side of ['L', 'R']) {
@@ -576,6 +587,15 @@ class FighterView {
       _m.makeBasis(_bx, _by, _bz);
       g.g.quaternion.setFromRotationMatrix(_m);
       g.g.position.copy(g.hand.pos);
+      // Telegraph: the glove about to be thrown glows, brightening as the punch nears
+      const pu = g.handState.punch;
+      let glow = 0;
+      if (pu && pu.phase === 'wind') glow = 0.4 + 2.2 * Math.min(1, pu.t / pu.wind);
+      else if (pu && pu.phase === 'ext') glow = 1.2;
+      g.glow = (g.glow || 0) + (glow - (g.glow || 0)) * 0.35;
+      g.mat.emissive.setRGB(1, pu && pu.def.aim === 'chest' ? 0.55 : 0.18, 0.02);
+      g.mat.emissiveIntensity = g.glow;
+      g.g.scale.setScalar(1 + g.glow * 0.04);
     }
     for (const s of this.shoes) {
       const fwdx = Math.sin(this.f.yaw), fwdz = Math.cos(this.f.yaw);

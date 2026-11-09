@@ -13,6 +13,7 @@ export const PUNCHES = {
   straight: { wind: 0.0, ext: 0.14, ret: 0.2, cost: 8, power: 1.0 },
   hook:     { wind: 0.06, ext: 0.18, ret: 0.22, cost: 12, power: 1.15 },
   uppercut: { wind: 0.07, ext: 0.16, ret: 0.22, cost: 12, power: 1.15 },
+  bodyhook: { wind: 0.06, ext: 0.18, ret: 0.24, cost: 12, power: 1.1 },
 };
 
 const ARM = 0.72;
@@ -33,6 +34,7 @@ export class Player {
     this.pos = new THREE.Vector3();
     this.vel = new THREE.Vector3();
     this.headBase = new THREE.Vector3();
+    this.armBase = new THREE.Vector3();   // where the arms hang from: slips move the head more than the hands
     this.headPos = new THREE.Vector3();
     this.chestPos = new THREE.Vector3();
     this.headVel = new THREE.Vector3();
@@ -40,6 +42,8 @@ export class Player {
     this.headOffVel = new THREE.Vector3();
     this.rotOff = new THREE.Vector3();
     this.rotVel = new THREE.Vector3();
+    this.dodgeOff = new THREE.Vector3();
+    this.onDodge = null;  // (dir) => void
     this.headRadius = 0.14;
     this.keys = new Set();
     this.sensitivity = 0.0022;
@@ -61,6 +65,7 @@ export class Player {
     });
     world.addConstraint(new DistanceConstraint(this.gloves[0].particle, this.gloves[1].particle, { length: 0.2, mode: 'min' }));
     this.view = new GloveView(scene, this);
+    this.avatar = new PlayerAvatar(scene, this);
     this.reset(0, 1.6, 0);
   }
 
@@ -71,6 +76,7 @@ export class Player {
     this.headOff.set(0, 0, 0); this.headOffVel.set(0, 0, 0); this.rotOff.set(0, 0, 0); this.rotVel.set(0, 0, 0);
     this.health = 100; this.stamina = 100; this.knockdowns = 0;
     this.mode = 'idle'; this.downT = 0; this.recover = 0; this.fall = 0;
+    this.dodge = null; this.dodgeCd = 0; this.dodgeOff.set(0, 0, 0); this.punchDuck = 0; this.punchDuckT = 0;
     for (const g of this.gloves) { g.punch = null; g.queued = null; }
     this.preStep(1 / 240);
     for (const g of this.gloves) { g.particle.teleport(g.target); g.particle.force.set(0, 0, 0); g.lastTarget.copy(g.target); }
@@ -96,6 +102,17 @@ export class Player {
     this.gloves[index].queued = type;
   }
 
+  /** Head movement: 'left' / 'right' slip or 'back' pull. */
+  requestDodge(dir) {
+    if (this.mode !== 'fight' || this.dodge || this.dodgeCd > 0 || this.stamina < 4) return false;
+    this.stamina -= 6;
+    this.dodge = { dir, t: 0 };
+    this.onDodge?.(dir);
+    return true;
+  }
+
+  get dodging() { return !!this.dodge && this.dodge.t < 0.65; }
+
   startPunch(g, type) {
     const def = PUNCHES[type];
     const tired = this.stamina < def.cost;
@@ -111,7 +128,8 @@ export class Player {
 
     // --- footwork
     let fx = 0, fz = 0;
-    if (active) {
+    const shift = k.has('ShiftLeft') || k.has('ShiftRight');
+    if (active && !shift) {
       if (k.has('KeyW')) fz += 1;
       if (k.has('KeyS')) fz -= 1;
       if (k.has('KeyD')) fx += 1;
@@ -132,7 +150,25 @@ export class Player {
     this.bobPhase += sp * h * 7;
 
     // --- posture
-    const duckT = active && k.has('KeyC') ? 0.3 : 0;
+    const duckT = (active && k.has('KeyC') ? 0.3 : 0) + this.punchDuck;
+    this.punchDuck += (this.punchDuckT - this.punchDuck) * (1 - Math.exp(-h * 14));
+
+    // --- head movement (slips / pull-back). Moves your head, shoulders and gloves.
+    this.dodgeCd -= h;
+    let ox = 0, oy = 0, oz = 0;
+    if (this.dodge) {
+      const d = this.dodge;
+      d.t += h;
+      if (d.t < 0.55) {
+        if (d.dir === 'back') { oy = -0.03; oz = 0.34; }
+        else { ox = d.dir === 'left' ? -0.34 : 0.34; oy = -0.1; oz = 0.04; }
+      }
+      if (d.t > 0.78) { this.dodge = null; this.dodgeCd = 0.1; }
+    }
+    const kd = 1 - Math.exp(-h * 20);
+    this.dodgeOff.x += (ox - this.dodgeOff.x) * kd;
+    this.dodgeOff.y += (oy - this.dodgeOff.y) * kd;
+    this.dodgeOff.z += (oz - this.dodgeOff.z) * kd;
     const kp = 1 - Math.exp(-h * 14);
     this.duck += (duckT - this.duck) * kp;
     this.lunge += (this.lungeT - this.lunge) * kp;
@@ -153,32 +189,34 @@ export class Player {
     } else this.fall = 0;
     const fallE = smooth(this.fall);
 
-    const height = THREE.MathUtils.lerp(this.standHeight - this.duck + Math.sin(this.bobPhase * 2) * 0.012 * Math.min(1, sp) +
+    const height = THREE.MathUtils.lerp(this.standHeight - this.duck + this.dodgeOff.y + Math.sin(this.bobPhase * 2) * 0.012 * Math.min(1, sp) +
       Math.sin(this.clock * 2.2) * 0.004, 0.45, fallE);
     const fwx = -sy, fwz = -cy;
-    this.headBase.set(this.pos.x + fwx * this.lunge, height, this.pos.z + fwz * this.lunge);
+    const dxw = cy * this.dodgeOff.x - fwx * this.dodgeOff.z, dzw = -sy * this.dodgeOff.x - fwz * this.dodgeOff.z;
+    this.headBase.set(this.pos.x + fwx * this.lunge + dxw, height, this.pos.z + fwz * this.lunge + dzw);
     this.headPos.copy(this.headBase).add(this.headOff);
     this.headAnchor.moveKinematic(this.headBase);
-    this.chestPos.set(this.pos.x + fwx * this.lunge * 0.5, height - 0.42, this.pos.z + fwz * this.lunge * 0.5);
+    this.armBase.set(this.headBase.x - dxw * 0.65, this.headBase.y - this.dodgeOff.y * 0.5, this.headBase.z - dzw * 0.65);
+    this.chestPos.set(this.pos.x + (fwx * this.lunge + dxw) * 0.5, height - 0.42, this.pos.z + (fwz * this.lunge + dzw) * 0.5);
     this.headVel.copy(this.vel).add(this.headOffVel);
 
     // --- shoulders follow the torso (yaw + twist only)
     _qy.setFromEuler(_e.set(0, this.yaw + this.twist, 0));
     _qf.setFromEuler(_e.set(this.pitch * 0.6, this.yaw + this.twist, 0));
     for (const g of this.gloves) {
-      _v.set(g.side * 0.19, -0.24, 0.02).applyQuaternion(_qy).add(this.headBase);
+      _v.set(g.side * 0.19, -0.24, 0.02).applyQuaternion(_qy).add(this.armBase);
       g.shoulder.moveKinematic(_v);
     }
 
     // --- gloves
-    this.lungeT = 0; this.twistT = 0;
+    this.lungeT = 0; this.twistT = 0; this.punchDuckT = 0;
     for (const g of this.gloves) {
       if (g.queued && (!g.punch || (g.punch.phase === 'ret' && g.punch.t > g.punch.def.wind + g.punch.def.ext + 0.08))) {
         this.startPunch(g, g.queued);
         g.queued = null;
       }
       this.gloveTarget(g, h, _t);
-      g.target.copy(_t).applyQuaternion(_qf).add(this.headBase);
+      g.target.copy(_t).applyQuaternion(_qf).add(this.armBase);
       this.driveGlove(g, h);
     }
 
@@ -190,8 +228,10 @@ export class Player {
   gloveTarget(g, h, out) {
     const s = g.side;
     const guard = this.guarding;
-    g.omega = guard ? 28 : 18;
-    g.maxAcc = guard ? 170 : 120;
+    // A tired guard is a weak guard: heavy shots push your own gloves into your face.
+    const sf = this.stamina / 100;
+    g.omega = guard ? 28 * (0.55 + 0.45 * sf) : 18;
+    g.maxAcc = guard ? 170 * (0.3 + 0.7 * sf) : 120;
     if (this.mode === 'down' || this.mode === 'rising') { g.omega = 10; return out.set(s * 0.26, -0.55, -0.3); }
     if (guard) out.set(s * 0.1, -0.05, -0.27);
     else out.set(s * 0.2, -0.17, -0.36);
@@ -205,6 +245,7 @@ export class Player {
       const u = smooth(pu.t / d.wind);
       if (pu.type === 'hook') { out.lerp(_a.set(s * 0.42, -0.1, -0.3), u); this.twistT = -s * 0.06; }
       else if (pu.type === 'uppercut') { out.lerp(_a.set(s * 0.13, -0.45, -0.28), u); this.lungeT = -0.02; }
+      else if (pu.type === 'bodyhook') { out.lerp(_a.set(s * 0.4, -0.42, -0.28), u); this.twistT = -s * 0.06; this.punchDuckT = 0.1; }
     } else if (pu.t < d.wind + d.ext) {
       if (pu.phase !== 'ext') { pu.phase = 'ext'; this.onSwing?.(g); }
       const u = smooth((pu.t - d.wind) / d.ext);
@@ -217,6 +258,10 @@ export class Player {
         _a.set(s * 0.45, -0.03, -0.55); _b.set(-s * 0.3, -0.03, -0.62);
         out.lerpVectors(_a, _b, u);
         this.lungeT = 0.04; this.twistT = s * 0.1;
+      } else if (pu.type === 'bodyhook') {
+        _a.set(s * 0.45, -0.42, -0.55); _b.set(-s * 0.25, -0.4, -0.72);
+        out.lerpVectors(_a, _b, u);
+        this.lungeT = 0.16;   // step in: body shots are thrown from closer this.twistT = s * 0.1; this.punchDuckT = 0.12;
       } else {
         _a.set(s * 0.1, -0.35, -0.45); _b.set(s * 0.03, 0.18, -0.72);
         out.lerpVectors(_a, _b, u);
@@ -276,7 +321,7 @@ export class Player {
     camera.rotation.set(
       this.pitch + this.rotOff.x - fallE * 0.35,
       this.yaw + this.twist + this.rotOff.y,
-      this.rotOff.z + fallE * 0.9,
+      this.rotOff.z + fallE * 0.9 - this.dodgeOff.x * 0.5,
       'YXZ',
     );
   }
@@ -340,4 +385,86 @@ function placeCylinder(mesh, a, b, r) {
   mesh.position.addVectors(a, b).multiplyScalar(0.5);
   mesh.quaternion.setFromUnitVectors(Y, _f.multiplyScalar(1 / len));
   mesh.scale.set(r, len, r);
+}
+
+// ---------------------------------------------------------------------------
+// Third-person body, only shown by the knockout cam (you never see it in first person).
+const _ax = new THREE.Vector3(), _ay = new THREE.Vector3(), _az = new THREE.Vector3();
+const _p1 = new THREE.Vector3(), _p2 = new THREE.Vector3(), _p3 = new THREE.Vector3(), _p4 = new THREE.Vector3();
+
+function orient(obj, xDir, yDir) {
+  _ax.copy(xDir).normalize();
+  _ay.copy(yDir).addScaledVector(_ax, -yDir.dot(_ax)).normalize();
+  _az.crossVectors(_ax, _ay);
+  _m.makeBasis(_ax, _ay, _az);
+  obj.quaternion.setFromRotationMatrix(_m);
+}
+
+class PlayerAvatar {
+  constructor(scene, player) {
+    this.player = player;
+    this.group = new THREE.Group();
+    this.group.visible = false;
+    scene.add(this.group);
+    const skin = new THREE.MeshStandardMaterial({ color: 0xd9a27c, roughness: 0.55 });
+    const shorts = new THREE.MeshStandardMaterial({ color: 0x1840c0, roughness: 0.4, metalness: 0.1 });
+    const trim = new THREE.MeshStandardMaterial({ color: 0xf4f1ea, roughness: 0.5 });
+    const dark = new THREE.MeshStandardMaterial({ color: 0x2a1a10, roughness: 0.8 });
+    const sphere = new THREE.SphereGeometry(1, 20, 14);
+    const cyl = new THREE.CylinderGeometry(1, 1, 1, 10);
+    const add = (geo, mat, parent = this.group) => { const m = new THREE.Mesh(geo, mat); m.castShadow = true; parent.add(m); return m; };
+    this.head = new THREE.Group(); this.group.add(this.head);
+    add(sphere, skin, this.head).scale.set(0.105, 0.125, 0.115);
+    const hair = add(sphere, dark, this.head); hair.scale.set(0.11, 0.075, 0.115); hair.position.set(0, 0.06, -0.015);
+    for (const sx of [-1, 1]) {
+      const eye = add(sphere, dark, this.head); eye.scale.setScalar(0.013); eye.position.set(sx * 0.038, 0.02, 0.103);
+      const ear = add(sphere, skin, this.head); ear.scale.set(0.015, 0.03, 0.022); ear.position.set(sx * 0.105, 0, 0);
+    }
+    const nose = add(sphere, skin, this.head); nose.scale.set(0.02, 0.028, 0.025); nose.position.set(0, -0.005, 0.118);
+    this.neck = add(cyl, skin);
+    this.chest = add(sphere, skin); this.chest.scale.set(0.21, 0.19, 0.13);
+    this.abs = add(sphere, skin); this.abs.scale.set(0.165, 0.17, 0.115);
+    this.shorts = add(sphere, shorts); this.shorts.scale.set(0.19, 0.17, 0.14);
+    this.belt = add(cyl, trim); this.belt.scale.set(0.18, 0.05, 0.13);
+    this.shoulders = [add(sphere, skin), add(sphere, skin)];
+    for (const m of this.shoulders) m.scale.setScalar(0.075);
+    this.legs = [-1, 1].map(() => ({ thigh: add(cyl, skin), shin: add(cyl, skin), knee: add(sphere, skin),
+      shoe: add(new THREE.BoxGeometry(0.1, 0.08, 0.25), trim) }));
+  }
+
+  update() {
+    const p = this.player;
+    const yaw = p.yaw + p.twist;
+    const sy = Math.sin(yaw), cy = Math.cos(yaw);
+    const left = _p1.set(-cy, 0, sy);          // the player's left
+    const fwd = _p2.set(-sy, 0, -cy);
+    const head = p.headAnchor.pos;
+    const sL = p.gloves[0].shoulder.pos, sR = p.gloves[1].shoulder.pos;
+    const sMid = _p3.addVectors(sL, sR).multiplyScalar(0.5);
+    const hip = _p4.set(p.pos.x, 0.93 - p.duck * 0.6 - p.punchDuck * 0.5, p.pos.z);
+    const up = _v.subVectors(sMid, hip);
+
+    orient(this.chest, left, up); this.chest.position.copy(sMid).addScaledVector(_ay, -0.11);
+    orient(this.abs, left, up); this.abs.position.lerpVectors(sMid, hip, 0.62);
+    orient(this.shorts, left, up); this.shorts.position.copy(hip).addScaledVector(_ay, -0.02);
+    orient(this.belt, left, up); this.belt.position.copy(hip).addScaledVector(_ay, 0.11);
+    this.shoulders[0].position.copy(sL); this.shoulders[1].position.copy(sR);
+    _f.subVectors(head, sMid);
+    orient(this.head, left, _f); this.head.position.copy(head);
+    placeCylinder(this.neck, sMid, head, 0.06);
+
+    this.legs.forEach((leg, i) => {
+      const side = i === 0 ? 1 : -1;        // +1 = left
+      const fwdOff = side > 0 ? 0.17 : -0.15;
+      const hipJ = _t.copy(hip).addScaledVector(left, side * 0.11);
+      const foot = _b.set(p.pos.x + left.x * side * 0.15 + fwd.x * fwdOff, 0.07, p.pos.z + left.z * side * 0.15 + fwd.z * fwdOff);
+      _a.copy(fwd).addScaledVector(left, side * 0.25);
+      solveTwoBone(hipJ, foot, 0.41, 0.44, _a, _el);
+      placeCylinder(leg.thigh, hipJ, _el, 0.08);
+      placeCylinder(leg.shin, _el, foot, 0.058);
+      leg.knee.position.copy(_el); leg.knee.scale.setScalar(0.068);
+      leg.shoe.position.copy(foot).addScaledVector(fwd, 0.05); leg.shoe.position.y = 0.05;
+      leg.shoe.rotation.set(0, yaw, 0);
+    });
+  }
 }
