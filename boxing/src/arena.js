@@ -1,13 +1,23 @@
-// The ring, the ropes (Verlet chains you can knock the opponent into), lights and crowd.
+// The octagon (an eight-sided fenced cage), lights and crowd.
 
 import * as THREE from 'three';
-import { Particle, DistanceConstraint, collideParticleSegment } from './physics.js';
 
-const ROPE_LINE = 3.18;
-const POST = 3.3;
-const ROPE_HEIGHTS = [0.45, 0.82, 1.18];
-const ROPE_NODES = 15;
-const ROPE_R = 0.028;
+/** Distance from the centre to the middle of each fence panel. */
+export const OCT_APOTHEM = 3.6;
+const OCT_CORNER = OCT_APOTHEM / Math.cos(Math.PI / 8);
+const FENCE_H = 1.75;
+// Outward normals of the 8 fence panels (a flat side faces each of +x, -x, +z, -z).
+const NORMALS = Array.from({ length: 8 }, (_, i) => [Math.cos((i * Math.PI) / 4), Math.sin((i * Math.PI) / 4)]);
+
+/** Push a point back inside the octagon, keeping it `margin` away from the fence. Returns how far it was pushed. */
+export function clampToOctagon(v, margin) {
+  let pushed = 0;
+  for (const [nx, nz] of NORMALS) {
+    const d = v.x * nx + v.z * nz - (OCT_APOTHEM - margin);
+    if (d > 0) { v.x -= nx * d; v.z -= nz * d; pushed = Math.max(pushed, d); }
+  }
+  return pushed;
+}
 
 export class Arena {
   constructor(scene, world) {
@@ -17,7 +27,6 @@ export class Arena {
     this.excitement = 0;
     this.buildLights();
     this.buildRing();
-    this.buildRopes();
     this.buildCrowd();
   }
 
@@ -51,28 +60,48 @@ export class Arena {
     floor.rotation.x = -Math.PI / 2; floor.position.y = -1.1; floor.receiveShadow = true;
     s.add(floor);
 
-    const apron = new THREE.Mesh(new THREE.BoxGeometry(7.8, 1.1, 7.8),
-      new THREE.MeshStandardMaterial({ color: 0x14204a, roughness: 0.6, emissive: 0x050a20 }));
-    apron.position.y = -0.551;
-    apron.receiveShadow = true;
-    s.add(apron);
+    // raised platform and the mat
+    const platform = new THREE.Mesh(new THREE.CylinderGeometry(OCT_CORNER + 0.45, OCT_CORNER + 0.55, 1.1, 8),
+      new THREE.MeshStandardMaterial({ color: 0x15161c, roughness: 0.7 }));
+    platform.rotation.y = Math.PI / 8;
+    platform.position.y = -0.551;
+    platform.receiveShadow = true;
+    s.add(platform);
+    const mat = new THREE.Mesh(new THREE.CircleGeometry(OCT_CORNER + 0.4, 8), new THREE.MeshStandardMaterial({ map: makeMatTexture(), roughness: 0.85 }));
+    mat.rotation.x = -Math.PI / 2; mat.rotation.z = Math.PI / 8;
+    mat.position.y = 0.001; mat.receiveShadow = true;
+    s.add(mat);
 
-    const canvas = new THREE.Mesh(new THREE.PlaneGeometry(7.6, 7.6),
-      new THREE.MeshStandardMaterial({ map: makeCanvasTexture(), roughness: 0.85 }));
-    canvas.rotation.x = -Math.PI / 2; canvas.position.y = 0.001; canvas.receiveShadow = true;
-    s.add(canvas);
+    // fence: posts, chain-link panels, padded top rail and bottom skirt
+    const postMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1e, metalness: 0.6, roughness: 0.4 });
+    const padMat = new THREE.MeshStandardMaterial({ color: 0x101014, roughness: 0.6 });
+    const skirtMat = new THREE.MeshStandardMaterial({ color: 0x8a1018, roughness: 0.5 });
+    const linkTex = makeChainLinkTexture();
+    const side = 2 * OCT_APOTHEM * Math.tan(Math.PI / 8);
+    linkTex.repeat.set(side * 7, FENCE_H * 7);
+    const linkMat = new THREE.MeshStandardMaterial({ map: linkTex, alphaTest: 0.4, side: THREE.DoubleSide, metalness: 0.5, roughness: 0.5 });
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI) / 4, ca = Math.cos(a), sa = Math.sin(a);
+      const panel = new THREE.Mesh(new THREE.PlaneGeometry(side, FENCE_H - 0.3), linkMat);
+      panel.position.set(ca * (OCT_APOTHEM + 0.12), 0.3 + (FENCE_H - 0.3) / 2, sa * (OCT_APOTHEM + 0.12));
+      panel.rotation.y = -a + Math.PI / 2;
+      s.add(panel);
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(side + 0.1, 0.16, 0.2), padMat);
+      rail.position.set(ca * (OCT_APOTHEM + 0.12), FENCE_H, sa * (OCT_APOTHEM + 0.12));
+      rail.rotation.y = -a + Math.PI / 2; rail.castShadow = true;
+      s.add(rail);
+      const skirt = new THREE.Mesh(new THREE.BoxGeometry(side + 0.05, 0.3, 0.12), skirtMat);
+      skirt.position.set(ca * (OCT_APOTHEM + 0.16), 0.15, sa * (OCT_APOTHEM + 0.16));
+      skirt.rotation.y = -a + Math.PI / 2;
+      s.add(skirt);
+      const c = a + Math.PI / 8;
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, FENCE_H + 0.1, 10), postMat);
+      post.position.set(Math.cos(c) * (OCT_CORNER + 0.13), (FENCE_H + 0.1) / 2, Math.sin(c) * (OCT_CORNER + 0.13));
+      post.castShadow = true;
+      s.add(post);
+    }
 
-    const postMat = new THREE.MeshStandardMaterial({ color: 0xb8bcc4, metalness: 0.8, roughness: 0.3 });
-    const padMats = [0xc01818, 0xeeeeee, 0x1840c0, 0xeeeeee].map((c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.5 }));
-    [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(([sx, sz], i) => {
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 1.5, 12), postMat);
-      post.position.set(sx * POST, 0.7, sz * POST); post.castShadow = true;
-      const pad = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.95, 0.22), padMats[i]);
-      pad.position.set(sx * (POST - 0.06), 0.82, sz * (POST - 0.06)); pad.rotation.y = Math.PI / 4; pad.castShadow = true;
-      s.add(post, pad);
-    });
-
-    // lighting truss above the ring
+    // lighting truss above the cage
     const truss = new THREE.Group();
     const tMat = new THREE.MeshStandardMaterial({ color: 0x222228, metalness: 0.6, roughness: 0.5 });
     const lamp = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xfff2d8, emissiveIntensity: 2.5 });
@@ -88,68 +117,15 @@ export class Arena {
     s.add(truss);
   }
 
-  buildRopes() {
-    const w = this.world;
-    this.ropes = [];
-    const sides = [
-      { axis: 'z', coord: -ROPE_LINE }, { axis: 'z', coord: ROPE_LINE },
-      { axis: 'x', coord: -ROPE_LINE }, { axis: 'x', coord: ROPE_LINE },
-    ];
-    for (const side of sides) {
-      for (const hgt of ROPE_HEIGHTS) {
-        const parts = [];
-        for (let i = 0; i < ROPE_NODES; i++) {
-          const t = -POST + (2 * POST * i) / (ROPE_NODES - 1);
-          const pos = side.axis === 'z' ? new THREE.Vector3(t, hgt, side.coord) : new THREE.Vector3(side.coord, hgt, t);
-          const pinned = i === 0 || i === ROPE_NODES - 1;
-          const p = new Particle(pos, { mass: pinned ? 0 : 0.5, radius: ROPE_R, gravityScale: 0.25, damping: 0.03, name: 'rope' });
-          parts.push(w.addParticle(p));
-        }
-        const seg = (2 * POST) / (ROPE_NODES - 1);
-        for (let i = 0; i < ROPE_NODES - 1; i++) {
-          w.addConstraint(new DistanceConstraint(parts[i], parts[i + 1], { length: seg * 0.985, stiffness: 0.25 }));
-        }
-        this.ropes.push({ ...side, parts });
-      }
-    }
-    const segCount = this.ropes.length * (ROPE_NODES - 1);
-    const mat = new THREE.MeshStandardMaterial({ color: 0xe8e8e8, roughness: 0.45 });
-    this.ropeMesh = new THREE.InstancedMesh(new THREE.CylinderGeometry(ROPE_R, ROPE_R, 1, 8), mat, segCount);
-    this.ropeMesh.castShadow = true;
-    this.ropeMesh.frustumCulled = false;
-    // colour the middle rope of each side
-    const red = new THREE.Color(0xc81818), white = new THREE.Color(0xeeeeee), blue = new THREE.Color(0x1a48c8);
-    let idx = 0;
-    this.ropes.forEach((r, ri) => {
-      for (let i = 0; i < ROPE_NODES - 1; i++) this.ropeMesh.setColorAt(idx++, ri % 3 === 1 ? (ri < 6 ? red : blue) : white);
-    });
-    this.scene.add(this.ropeMesh);
-  }
-
-  /** Rope contacts for ragdoll particles, and the player's body pressing into ropes. */
-  collideRopes(particles, player) {
-    for (const rope of this.ropes) {
-      const ax = rope.axis;
-      for (const p of particles) {
-        if (Math.abs(p.pos[ax] - rope.coord) > 0.45) continue;
-        const parts = rope.parts;
-        for (let i = 0; i < parts.length - 1; i++) collideParticleSegment(p, parts[i], parts[i + 1], ROPE_R);
-      }
-      if (Math.abs(player.pos[ax] - rope.coord) < 0.5) {
-        for (const rp of rope.parts) {
-          if (!rp.invMass || rp.pos.y > player.headBase.y + 0.1) continue;
-          const dx = rp.pos.x - player.pos.x, dz = rp.pos.z - player.pos.z;
-          const d = Math.hypot(dx, dz);
-          const r = 0.32;
-          if (d < r && d > 1e-6) { rp.pos.x += (dx / d) * (r - d); rp.pos.z += (dz / d) * (r - d); }
-        }
-      }
-    }
-    // Hard wall just outside the ropes so nothing ever escapes the ring
+  /** The fence: keeps the opponent's body parts and the player inside the cage. */
+  collideCage(particles, player) {
+    let hit = 0;
     for (const p of particles) {
-      if (Math.abs(p.pos.x) > ROPE_LINE + 0.12) p.pos.x = Math.sign(p.pos.x) * (ROPE_LINE + 0.12);
-      if (Math.abs(p.pos.z) > ROPE_LINE + 0.12) p.pos.z = Math.sign(p.pos.z) * (ROPE_LINE + 0.12);
+      const d = clampToOctagon(p.pos, p.radius);
+      if (d > 0) hit = Math.max(hit, d);
     }
+    clampToOctagon(player.pos, 0.35);
+    return hit;
   }
 
   buildCrowd() {
@@ -230,57 +206,55 @@ export class Arena {
     }
   }
 
-  updateRopes() {
-    const m = new THREE.Matrix4();
-    const q = new THREE.Quaternion();
-    const d = new THREE.Vector3();
-    const mid = new THREE.Vector3();
-    const sc = new THREE.Vector3();
-    const up = new THREE.Vector3(0, 1, 0);
-    let idx = 0;
-    for (const r of this.ropes) {
-      for (let i = 0; i < r.parts.length - 1; i++) {
-        const a = r.parts[i].pos, b = r.parts[i + 1].pos;
-        d.subVectors(b, a);
-        const len = d.length();
-        mid.addVectors(a, b).multiplyScalar(0.5);
-        q.setFromUnitVectors(up, d.multiplyScalar(1 / len));
-        sc.set(1, len + 0.01, 1);
-        m.compose(mid, q, sc);
-        this.ropeMesh.setMatrixAt(idx++, m);
-      }
-    }
-    this.ropeMesh.instanceMatrix.needsUpdate = true;
-  }
 }
 
-function makeCanvasTexture() {
+function makeMatTexture() {
   const c = document.createElement('canvas');
   c.width = c.height = 1024;
   const g = c.getContext('2d');
-  g.fillStyle = '#d6dae2';
+  g.fillStyle = '#e4e6ea';
   g.fillRect(0, 0, 1024, 1024);
-  // subtle cloth noise
   for (let i = 0; i < 9000; i++) {
     g.fillStyle = `rgba(0,0,0,${Math.random() * 0.04})`;
     g.fillRect(Math.random() * 1024, Math.random() * 1024, 2, 2);
   }
-  g.strokeStyle = 'rgba(20,32,74,0.55)';
+  // centre octagon and logo
+  g.strokeStyle = 'rgba(140,16,24,0.6)';
   g.lineWidth = 10;
-  g.beginPath(); g.arc(512, 512, 170, 0, Math.PI * 2); g.stroke();
-  g.fillStyle = 'rgba(20,32,74,0.6)';
-  g.font = 'bold 64px Arial, sans-serif';
+  g.beginPath();
+  for (let i = 0; i <= 8; i++) {
+    const a = (i * Math.PI) / 4 + Math.PI / 8;
+    const x = 512 + Math.cos(a) * 190, y = 512 + Math.sin(a) * 190;
+    if (i) g.lineTo(x, y); else g.moveTo(x, y);
+  }
+  g.stroke();
+  g.fillStyle = 'rgba(20,20,26,0.75)';
   g.textAlign = 'center';
+  g.font = 'bold 64px Arial, sans-serif';
   g.fillText('KNOCKOUT', 512, 500);
   g.font = 'bold 40px Arial, sans-serif';
-  g.fillText('PHYSICS', 512, 555);
+  g.fillText('PHYSICS  MMA', 512, 555);
   g.font = 'italic 28px Georgia, serif';
   g.fillText('F = m a', 512, 600);
-  // corner wear marks
-  g.fillStyle = 'rgba(0,0,0,0.05)';
-  for (const [x, y] of [[90, 90], [934, 90], [90, 934], [934, 934]]) { g.beginPath(); g.arc(x, y, 120, 0, Math.PI * 2); g.fill(); }
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 8;
+  return tex;
+}
+
+/** One diamond of chain-link fence, tiled across each panel. */
+function makeChainLinkTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d');
+  g.clearRect(0, 0, 64, 64);
+  g.strokeStyle = '#c8ccd4';
+  g.lineWidth = 5;
+  g.beginPath();
+  g.moveTo(32, 0); g.lineTo(64, 32); g.lineTo(32, 64); g.lineTo(0, 32); g.closePath();
+  g.stroke();
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 4;
   return tex;
 }

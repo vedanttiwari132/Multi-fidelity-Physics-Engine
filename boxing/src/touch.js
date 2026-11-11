@@ -5,7 +5,9 @@
 //   LEFT / RIGHT  one per glove. Tap = straight, swipe sideways = hook,
 //                 swipe up = uppercut, swipe down = body hook.
 //   GUARD, DUCK   hold.
-//   SLIP < >      slip your head left / right.
+//   SLIP < >      slip your head and sidestep left / right.
+//   JUMP          jump (punch in the air for a superman punch).
+//   KICK          tap = right kick, swipe left = left kick.
 // When you're knocked down, tapping any button helps you get up.
 
 const SWIPE = 28;        // px before a press counts as a swipe
@@ -27,8 +29,8 @@ export class TouchControls {
    * @param {() => void} o.onPress    any button pressed (used to get up after a knockdown)
    * @param {() => void} o.onPause
    */
-  constructor({ root, player, active, onPress, onPause }) {
-    Object.assign(this, { root, player, active, onPress, onPause });
+  constructor({ root, player, active, onPress, onPause, onJump }) {
+    Object.assign(this, { root, player, active, onPress, onPause, onJump: onJump || (() => player.requestJump()) });
     this.stick = null;   // { id, x0, y0 }
     this.look = null;    // { id, x, y }
     this.build();
@@ -46,14 +48,16 @@ export class TouchControls {
           <button class="t-btn t-small" data-slip="right" aria-label="Slip right">SLIP ▶</button>
         </div>
         <div class="t-row">
+          <button class="t-btn t-hold t-jump" data-jump="1">JUMP</button>
           <button class="t-btn t-hold" data-key="KeyC">DUCK</button>
-          <button class="t-btn t-hold" data-key="Space">GUARD</button>
+          <button class="t-btn t-hold" data-key="ShiftLeft">GUARD</button>
         </div>
         <div class="t-row">
+          <button class="t-btn t-hold t-kick" data-kick="1">KICK</button>
           <button class="t-btn t-punch" data-hand="0">LEFT</button>
           <button class="t-btn t-punch" data-hand="1">RIGHT</button>
         </div>
-        <div class="t-legend">tap jab · swipe ↔ hook · ↑ upper · ↓ body</div>
+        <div class="t-legend">tap jab · swipe ↔ hook · ↑ upper · ↓ body · jump + punch: superman</div>
       </div>`;
     this.stickEl = r.querySelector('.t-stick');
     this.knobEl = r.querySelector('.t-knob');
@@ -69,9 +73,37 @@ export class TouchControls {
       b.addEventListener('pointerdown', (e) => {
         e.stopPropagation(); e.preventDefault();
         this.onPress();
-        if (this.active()) this.player.requestDodge(b.dataset.slip);
+        if (this.active()) this.player.requestDash(b.dataset.slip);
       });
     }
+
+    const jump = r.querySelector('[data-jump]');
+    jump.addEventListener('pointerdown', (e) => {
+      e.stopPropagation(); e.preventDefault();
+      this.onPress();
+      if (this.active()) this.onJump();
+    });
+
+    // KICK: tap = right (rear) leg, swipe left = left (lead) leg
+    const kick = r.querySelector('[data-kick]');
+    let kickStart = null;
+    kick.addEventListener('pointerdown', (e) => {
+      e.stopPropagation(); e.preventDefault();
+      capture(kick, e);
+      this.onPress();
+      kickStart = e.clientX;
+      kick.classList.add('on');
+    });
+    const endKick = (e) => {
+      e.stopPropagation();
+      if (kickStart === null) return;
+      const side = e.clientX - kickStart < -SWIPE ? -1 : 1;
+      kickStart = null;
+      kick.classList.remove('on');
+      if (this.active()) this.player.requestKick(side);
+    };
+    kick.addEventListener('pointerup', endKick);
+    kick.addEventListener('pointercancel', () => { kickStart = null; kick.classList.remove('on'); });
 
     for (const b of r.querySelectorAll('[data-key]')) {
       const key = b.dataset.key;
@@ -158,7 +190,7 @@ export class TouchControls {
       this.stick = this.look = null;
       this.stickEl.hidden = true;
       this.player.touchMove = null;
-      this.player.keys.delete('Space'); this.player.keys.delete('KeyC');
+      this.player.keys.delete('ShiftLeft'); this.player.keys.delete('KeyC');
       for (const b of this.root.querySelectorAll('.on')) b.classList.remove('on');
     }
   }

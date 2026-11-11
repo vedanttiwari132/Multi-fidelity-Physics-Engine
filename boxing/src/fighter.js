@@ -8,6 +8,7 @@
 
 import * as THREE from 'three';
 import { Particle, DistanceConstraint, HingeConstraint, solveTwoBone } from './physics.js';
+import { clampToOctagon, OCT_APOTHEM } from './arena.js';
 
 export const UPPER_ARM = 0.31, FOREARM = 0.34, THIGH = 0.41, SHIN = 0.44;
 const G = 9.81;
@@ -21,8 +22,8 @@ const REST = {
   shoulderR: [-0.21, 1.43, 0.00, 3.0, 0.08, 14],
   elbowL:    [0.27, 1.15, 0.14, 2.0, 0.06, 8],
   elbowR:    [-0.27, 1.15, 0.12, 2.0, 0.06, 8],
-  handL:     [0.2, 1.24, 0.32, 2.5, 0.11, 18],
-  handR:     [-0.2, 1.29, 0.18, 2.5, 0.11, 18],
+  handL:     [0.2, 1.24, 0.32, 2.5, 0.09, 18],   // small MMA gloves
+  handR:     [-0.2, 1.29, 0.18, 2.5, 0.09, 18],
   belly:     [0.00, 1.09, 0.00, 10., 0.16, 14],
   pelvis:    [0.00, 0.93, 0.00, 12., 0.15, 16],
   hipL:      [0.11, 0.89, 0.00, 4.0, 0.09, 16],
@@ -66,10 +67,19 @@ const REGION = {
   pelvis: 'low', hipL: 'low', hipR: 'low', kneeL: 'low', kneeR: 'low', footL: 'low', footR: 'low',
 };
 
+// kick / superman: how often he throws them. counter: chance to punish your misses and blocked shots.
+// adapt: how much he reads your defensive habits. feint: chance a wind-up is fake, to bait your dodge.
 export const DIFFICULTY = {
-  easy:   { react: 0.42, block: 0.25, slip: 0.10, aggression: 0.55, telegraph: 0.42, damage: 0.6, power: 0.85, accuracy: 0.09, speed: 1.3 },
-  normal: { react: 0.30, block: 0.42, slip: 0.20, aggression: 0.9, telegraph: 0.32, damage: 0.85, power: 1.0, accuracy: 0.06, speed: 1.6 },
-  hard:   { react: 0.19, block: 0.58, slip: 0.30, aggression: 1.3, telegraph: 0.24, damage: 1.1, power: 1.1, accuracy: 0.035, speed: 1.9 },
+  easy:     { react: 0.42, block: 0.25, slip: 0.10, aggression: 0.55, telegraph: 0.42, damage: 0.6, power: 0.85, accuracy: 0.09, speed: 1.3,
+    kick: 0.1, superman: 0.02, counter: 0.1, adapt: 0, feint: 0 },
+  normal:   { react: 0.30, block: 0.42, slip: 0.20, aggression: 0.9, telegraph: 0.32, damage: 0.85, power: 1.0, accuracy: 0.06, speed: 1.6,
+    kick: 0.18, superman: 0.04, counter: 0.3, adapt: 0.3, feint: 0.04 },
+  hard:     { react: 0.19, block: 0.58, slip: 0.30, aggression: 1.3, telegraph: 0.24, damage: 1.1, power: 1.1, accuracy: 0.035, speed: 1.9,
+    kick: 0.24, superman: 0.06, counter: 0.55, adapt: 0.6, feint: 0.1 },
+  expert:   { react: 0.15, block: 0.68, slip: 0.38, aggression: 1.6, telegraph: 0.2, damage: 1.25, power: 1.15, accuracy: 0.025, speed: 2.1,
+    kick: 0.28, superman: 0.07, counter: 0.75, adapt: 0.85, feint: 0.15 },
+  champion: { react: 0.11, block: 0.78, slip: 0.48, aggression: 1.9, telegraph: 0.17, damage: 1.4, power: 1.2, accuracy: 0.015, speed: 2.3,
+    kick: 0.3, superman: 0.08, counter: 0.9, adapt: 1, feint: 0.2 },
 };
 
 const PUNCHES = {
@@ -79,10 +89,27 @@ const PUNCHES = {
   hookR:  { side: -1, kind: 'hook', wind: 0.12, ext: 0.2, ret: 0.28, aim: 'head', power: 1.25 },
   bodyR:  { side: -1, kind: 'straight', wind: 0.08, ext: 0.17, ret: 0.26, aim: 'chest', power: 1.0 },
   upperR: { side: -1, kind: 'upper', wind: 0.12, ext: 0.17, ret: 0.28, aim: 'head', power: 1.3 },
+  // leaps in from range: hits like a truck, but the wind-up is long and obvious
+  superman: { side: -1, kind: 'superman', wind: 0.45, ext: 0.22, ret: 0.34, aim: 'head', power: 1.6 },
+  // roundhouse kicks with the real legs, mostly at your thighs
+  kickL:  { side: 1, kind: 'kick', wind: 0.14, ext: 0.22, ret: 0.3, aim: 'legs', power: 1.3 },
+  kickR:  { side: -1, kind: 'kick', wind: 0.16, ext: 0.22, ret: 0.32, aim: 'legs', power: 1.4 },
+  kickBody: { side: -1, kind: 'kick', wind: 0.18, ext: 0.22, ret: 0.32, aim: 'chest', power: 1.4 },
 };
 export const PUNCH_LABEL = {
   jab: 'JAB', cross: 'CROSS', hookL: 'LEFT HOOK', hookR: 'RIGHT HOOK', bodyR: 'BODY SHOT', upperR: 'UPPERCUT',
+  superman: 'SUPERMAN PUNCH', kickL: 'LEFT KICK', kickR: 'RIGHT KICK', kickBody: 'BODY KICK',
 };
+const KICK_COMBOS = [['kickR'], ['jab', 'kickR'], ['kickL'], ['jab', 'cross', 'kickR'], ['kickBody'], ['cross', 'kickL']];
+const COUNTERS = [['cross'], ['hookR'], ['cross', 'hookL'], ['upperR'], ['hookL', 'cross']];
+// what beats each defensive habit
+const READS = {
+  duck: [['upperR', 'hookL'], ['jab', 'upperR'], ['kickBody']],
+  slip: [['hookL', 'hookR'], ['jab', 'hookR'], ['cross', 'hookL']],
+  block: [['bodyR', 'hookL'], ['kickR'], ['jab', 'kickL'], ['bodyR', 'kickR']],
+  jump: [['kickBody'], ['jab', 'cross']],
+};
+const pick = (list) => list[Math.floor(Math.random() * list.length)];
 const COMBOS = [
   ['jab'], ['jab', 'cross'], ['jab', 'jab', 'cross'], ['cross', 'hookL'], ['jab', 'cross', 'hookL'],
   ['bodyR', 'hookL'], ['hookR'], ['upperR', 'hookL'], ['jab', 'bodyR'], ['jab', 'upperR'],
@@ -150,6 +177,8 @@ export class Opponent {
     this.handList = [this.hands.L, this.hands.R];
     this.p.handL.hand = this.hands.L;
     this.p.handR.hand = this.hands.R;
+    // kicks are tracked like a third hand, so blocking, dodging and hit checks treat them the same way
+    this.kickSlot = { name: 'kick', punch: null };
 
     this.base = new THREE.Vector3();
     this.home = new THREE.Vector3();
@@ -174,6 +203,9 @@ export class Opponent {
     this.lean = this.leanT = 0; this.slip = this.slipT = 0; this.crouch = this.crouchT = 0; this.twist = this.twistT = 0;
     this.stepPhase = 0; this.clock = 0;
     this.tone = 1; this.daze = 0; this.health = 100;
+    this.cons = 100; this.balance = 100; this.lastHitT = -10; this.tripT = 0; this.jumpV = 0;
+    this.habits = { duck: 0, slip: 0, block: 0, jump: 0 };
+    this.kickSlot.punch = null;
     this.mode = 'idle'; this.tactic = 'stalk'; this.tacticT = 1;
     this.comboQueue = []; this.attackCd = 1.0; this.coverT = 0; this.slipTimer = 0; this.slipDir = 1;
     this.staggerT = 0; this.circleDir = Math.random() < 0.5 ? -1 : 1; this.incoming = null; this.lastPunchAt = -10;
@@ -187,9 +219,9 @@ export class Opponent {
   }
 
   resetKeepHealth(x, z, yaw) {
-    const { health, knockdowns } = this;
+    const { health, knockdowns, cons, habits } = this;
     this.reset(x, z, yaw);
-    this.health = health; this.knockdowns = knockdowns;
+    this.health = health; this.knockdowns = knockdowns; this.cons = Math.max(60, cons); this.habits = habits;
   }
 
   // ----- frames ------------------------------------------------------------
@@ -220,6 +252,7 @@ export class Opponent {
       _w.set(r.pos.x + r.vel.x * 0.05, 0, r.pos.z + r.vel.z * 0.05);
       this.base.lerp(_w, 1 - Math.exp(-h * 14));
       this.moveVel.copy(r.vel);
+      this.base.y += ((r.jumpY || 0) - this.base.y) * (1 - Math.exp(-h * 20));
       let dy = (r.yaw + Math.PI) - this.yaw;
       dy = Math.atan2(Math.sin(dy), Math.cos(dy));
       this.yaw += dy * (1 - Math.exp(-h * 16));
@@ -236,8 +269,13 @@ export class Opponent {
     } else {
       this.moveVel.set(0, 0, 0);
     }
-    this.base.x = Math.max(-2.65, Math.min(2.65, this.base.x));
-    this.base.z = Math.max(-2.65, Math.min(2.65, this.base.z));
+    clampToOctagon(this.base, 0.7);
+    // jumping (the superman punch)
+    if (!this.remote && (this.jumpV > 0 || this.base.y > 0)) {
+      this.jumpV -= 9.81 * h;
+      this.base.y = Math.max(0, this.base.y + this.jumpV * h);
+      if (this.base.y === 0) this.jumpV = 0;
+    }
 
     const speed = Math.hypot(this.moveVel.x, this.moveVel.z);
     this.stepPhase += speed * h * 11;
@@ -280,9 +318,17 @@ export class Opponent {
       this.toWorld(_l, T[name]);
     }
 
+    // A kicking leg swings through instead
+    const kick = this.kickSlot.punch;
+    if (kick) {
+      if (this.remote) T[kick.foot].copy(this.remote.kickPos);
+      else this.kickTarget(kick, h, T[kick.foot]);
+    }
+
     // Knees via IK
     for (const [hip, knee, foot, side] of [['hipL', 'kneeL', 'footL', 1], ['hipR', 'kneeR', 'footR', -1]]) {
-      this.dirToWorld(_pole.set(side * 0.25, 0, 1), _w);
+      const kicking = kick && kick.foot === foot;
+      this.dirToWorld(_pole.set(side * (kicking ? 0.6 : 0.25), kicking ? 0.6 : 0, 1), _w);
       solveTwoBone(T[hip], T[foot], THIGH, SHIN, _w, T[knee]);
     }
 
@@ -292,6 +338,36 @@ export class Opponent {
       this.dirToWorld(hand.pole, _w);
       solveTwoBone(T[hand.shoulder], T[hand.name], UPPER_ARM, FOREARM, _w, T[hand.elbow]);
     }
+  }
+
+  /** Roundhouse kick path for the kicking foot. */
+  kickTarget(k, h, out) {
+    k.t += h;
+    const d = k.def, sd = d.side;
+    const X = this.dirToWorld(_l.set(1, 0, 0), _x);  // its left
+    const Z = this.forward;
+    if (k.t < k.wind) {
+      k.phase = 'wind';
+      this.toWorld(_l.set(sd * 0.28, 0.5, 0.12), out);   // chamber the knee
+      this.twistT = -sd * 0.06; this.leanT = -0.04;
+    } else if (k.t < k.wind + d.ext) {
+      if (k.phase !== 'ext') { k.phase = 'ext'; this.onSwing?.(this); this.moveVel.addScaledVector(Z, 0.4); }
+      const u = smooth((k.t - k.wind) / d.ext);
+      _w.copy(k.aim).addScaledVector(X, sd * 0.75).addScaledVector(Z, -0.25);
+      _f.copy(k.aim).addScaledVector(X, -sd * 0.35).addScaledVector(Z, 0.15);
+      out.lerpVectors(_w, _f, u);
+      this.twistT = sd * 0.16; this.leanT = -0.08;
+    } else if (k.t < k.wind + d.ext + d.ret) {
+      if (k.phase !== 'ret') {
+        k.phase = 'ret';
+        if (!k.hit && !k.interrupted) this.onWhiff?.(this, this.kickSlot);
+      }
+      this.toWorld(_l.copy(this.local[k.foot]).setY(0.25), out);
+      this.twistT = 0; this.leanT = 0;
+    } else {
+      this.kickSlot.punch = null;
+    }
+    return out;
   }
 
   handTarget(hand, h, ctx, out) {
@@ -324,14 +400,23 @@ export class Opponent {
     const P = this.diff.power * d.power;
     if (pu.t < pu.wind) {
       pu.phase = 'wind';
-      if (d.kind === 'hook') { out.addScaledVector(X, sd * 0.16); out.addScaledVector(Z, -0.04); hand.pole.set(sd, 0.3, -0.3); this.twistT = -sd * 0.05; }
+      if (pu.feint && pu.t + h >= pu.wind) {   // a fake: pull it back and throw the real one
+        hand.punch = null;
+        this.comboQueue.unshift(pu.name);
+        return out;
+      }
+      if (d.kind === 'superman') { out.addScaledVector(Z, -0.18); out.y -= 0.12; this.crouchT = 0.2; this.twistT = -sd * 0.08; }
+      else if (d.kind === 'hook') { out.addScaledVector(X, sd * 0.16); out.addScaledVector(Z, -0.04); hand.pole.set(sd, 0.3, -0.3); this.twistT = -sd * 0.05; }
       else if (d.kind === 'upper') { out.y -= 0.2; this.crouchT = 0.1; hand.pole.set(sd * 0.5, -1, 0.2); }
       else { out.addScaledVector(Z, -0.09); out.y -= 0.03; this.twistT = -sd * 0.04; }
     } else if (pu.t < pu.wind + d.ext) {
-      if (pu.phase !== 'ext') { pu.phase = 'ext'; this.onSwing?.(this); this.moveVel.addScaledVector(Z, 0.6); }
+      if (pu.phase !== 'ext') {
+        pu.phase = 'ext'; this.onSwing?.(this); this.moveVel.addScaledVector(Z, 0.6);
+        if (d.kind === 'superman') { this.jumpV = 2.4; this.moveVel.addScaledVector(Z, 3); this.crouchT = -0.05; }
+      }
       const u = (pu.t - pu.wind) / d.ext;
-      hand.omega = 34 * P; hand.maxAcc = 320 * P;
-      if (d.kind === 'straight') {
+      hand.omega = 34 * Math.min(1.3, P); hand.maxAcc = 320 * P;
+      if (d.kind === 'straight' || d.kind === 'superman') {
         _w.subVectors(pu.aim, this.target[hand.shoulder]).normalize();
         out.copy(pu.aim).addScaledVector(_w, 0.3);
         this.leanT = 0.12; this.twistT = sd * 0.07;
@@ -369,6 +454,11 @@ export class Opponent {
       const T = this.target[name], LT = this.lastTarget[name];
       let w = p.omega, maxAcc = 75;
       if (p.hand) { w = p.hand.omega; maxAcc = p.hand.maxAcc; }
+      const k = this.kickSlot.punch;
+      if (k && k.foot === name) {
+        const P = this.remote ? 1 : this.diff.power * k.def.power;
+        w = k.phase === 'ext' || this.remote ? 34 : 22; maxAcc = k.phase === 'ext' || this.remote ? 380 * P : 160;
+      }
       // target velocity (clamped to avoid spikes when a target jumps)
       _w.subVectors(T, LT).multiplyScalar(1 / h);
       const tv = _w.length();
@@ -385,15 +475,16 @@ export class Opponent {
   }
 
   // ----- AI (per frame) ----------------------------------------------------
-  notifyIncoming(time, low = false) {
-    if (this.mode !== 'fight' || this.incoming) return;
-    this.incoming = { at: time + this.diff.react * (0.8 + Math.random() * 0.5), low };
+  /** big: a superman punch's jump, which he reads much more easily. */
+  notifyIncoming(time, low = false, big = false) {
+    if (this.mode !== 'fight' || (this.incoming && !big)) return;
+    this.incoming = { at: time + this.diff.react * (big ? 0.6 : 1) * (0.8 + Math.random() * 0.5), low, big };
   }
 
   /** Online: posture follows where the other player holds their head (slips, ducks, leans). */
   thinkRemote(dt) {
     const r = this.remote;
-    if (this.mode === 'down') this.tone = Math.max(0, this.tone - dt * 5);
+    if (this.mode === 'down' || this.mode === 'tripped') this.tone = Math.max(0, this.tone - dt * 5);
     else if (this.mode === 'rising') {
       this.tone = Math.min(1, this.tone + dt * 0.75);
       if (this.tone >= 1) this.mode = 'fight';
@@ -411,15 +502,26 @@ export class Opponent {
 
   think(dt, ctx) {
     if (this.remote) { this.thinkRemote(dt); return; }
-    this.daze = Math.max(0, this.daze - dt * 0.22);
     this.winded = Math.max(0, (this.winded || 0) - dt * 0.08);
     this.coverT -= dt; this.coverLowT = (this.coverLowT || 0) - dt; this.slipTimer -= dt; this.tacticT -= dt; this.attackCd -= dt; this.staggerT -= dt;
+    for (const k in this.habits) this.habits[k] *= Math.exp(-dt * 0.08);
+
+    // consciousness and balance come back when he stops getting hit
+    if (this.mode === 'fight' || this.mode === 'idle') {
+      if (this.clock - this.lastHitT > 2) this.cons = Math.min(100, this.cons + dt * 5);
+      if (!this.kickSlot.punch) this.balance = Math.min(100, this.balance + dt * 28 * (0.5 + 0.5 * this.cons / 100));
+    }
+    this.daze = Math.max(0, (65 - this.cons) / 35);   // drops his guard and slows him as he fades
 
     if (this.mode === 'down') this.tone = Math.max(0, this.tone - dt * 5);
-    else if (this.mode === 'rising') {
+    else if (this.mode === 'tripped') {
+      this.tone = Math.max(0.03, this.tone - dt * 6);
+      this.tripT += dt;
+      if (this.tripT > 1.7) this.rise(this.health, true);
+    } else if (this.mode === 'rising') {
       this.tone = Math.min(1, this.tone + dt * 0.75);
       if (this.tone >= 1) { this.mode = 'fight'; this.coverT = 1.2; this.tactic = 'retreat'; this.tacticT = 1.2; }
-    } else this.tone = THREE.MathUtils.clamp(1 - this.daze * 0.45, 0.5, 1);
+    } else this.tone = 0.45 + 0.55 * Math.pow(this.cons / 100, 0.7);   // the lower his consciousness, the wobblier
 
     const dx = ctx.playerPos.x - this.base.x, dz = ctx.playerPos.z - this.base.z;
     const dist = Math.hypot(dx, dz) || 1e-3;
@@ -428,8 +530,12 @@ export class Opponent {
     this.cover = this.coverT > 0;
     this.coverLow = this.coverLowT > 0;
     this.slipT = this.slipTimer > 0 ? this.slipDir * 0.16 : 0;
-    if (!this.handList.some((h) => h.punch)) {
+    if (!this.handList.some((h) => h.punch) && !this.kickSlot.punch) {
       this.leanT = 0; this.twistT = 0; this.crouchT = this.slipTimer > 0 ? 0.07 : 0;
+      // dazed: he sways on his feet
+      const inst = Math.pow(1 - this.cons / 100, 1.5);
+      this.leanT += Math.sin(this.clock * 1.7) * 0.09 * inst;
+      this.slipT += Math.sin(this.clock * 1.1 + 1) * 0.12 * inst;
     }
 
     if (this.mode === 'idle') {
@@ -444,7 +550,7 @@ export class Opponent {
 
     // defensive reaction to the player's punches
     if (this.incoming && ctx.time >= this.incoming.at) {
-      const r = Math.random();
+      const r = Math.random() - (this.incoming.big ? 0.35 : 0);
       if (r < this.diff.block) { if (this.incoming.low) this.coverLowT = 0.55; else this.coverT = 0.55; }
       else if (r < this.diff.block + this.diff.slip) { this.slipTimer = 0.35; this.slipDir = Math.random() < 0.5 ? -1 : 1; }
       this.incoming = null;
@@ -464,52 +570,95 @@ export class Opponent {
       if (this.tacticT < 0) { this.tacticT = 1 + Math.random() * 2; if (Math.random() < 0.4) this.circleDir *= -1; }
       if (dist < range + 0.15 && this.attackCd <= 0 && !this.cover && !dazed) {
         this.tactic = 'combo';
-        this.comboQueue = [...COMBOS[Math.floor(Math.random() * COMBOS.length)]];
+        this.comboQueue = this.chooseCombo();
+      } else if (dist > 1.25 && dist < 1.9 && this.attackCd <= 0 && !dazed && Math.random() < this.diff.superman * dt * 6) {
+        this.tactic = 'combo';
+        this.comboQueue = ['superman'];   // from range: leap in
       }
     } else if (this.tactic === 'combo') {
       radial = THREE.MathUtils.clamp((dist - (range - 0.06)) * 3, -1, 1);
-      const busy = this.handList.some((h) => h.punch && h.punch.phase !== 'ret');
-      if (this.comboQueue.length && !busy && ctx.time - this.lastPunchAt > 0.12 && dist < 1.2) {
+      const busy = this.handList.some((h) => h.punch && h.punch.phase !== 'ret') || (this.kickSlot.punch && this.kickSlot.punch.phase !== 'ret');
+      const reach = this.comboQueue[0] === 'superman' ? 2.0 : 1.2;
+      if (this.comboQueue.length && !busy && ctx.time - this.lastPunchAt > 0.12 && dist < reach) {
         this.startPunch(this.comboQueue.shift(), ctx);
       }
-      if (!this.comboQueue.length && !this.handList.some((h) => h.punch)) {
+      if (!this.comboQueue.length && !this.handList.some((h) => h.punch) && !this.kickSlot.punch) {
         this.tactic = Math.random() < 0.5 ? 'retreat' : 'stalk';
         this.tacticT = 0.4 + Math.random() * 0.6;
         this.attackCd = (0.5 + Math.random() * 1.3) / this.diff.aggression;
       }
-      if (dist > 1.5) { this.tactic = 'stalk'; this.comboQueue = []; }
+      if (dist > (this.comboQueue[0] === 'superman' ? 2.2 : 1.5)) { this.tactic = 'stalk'; this.comboQueue = []; }
     } else if (this.tactic === 'retreat') {
       radial = THREE.MathUtils.clamp((dist - 1.35) * 3, -1, 1);
       lateral = this.circleDir * 0.6;
       if (this.tacticT < 0) { this.tactic = 'stalk'; this.tacticT = 1; }
     }
-    // Back away from the ropes
-    const edge = Math.max(Math.abs(this.base.x), Math.abs(this.base.z));
-    if (edge > 2.3) { lateral += this.circleDir * 0.6; }
+    // Circle off the fence
+    if (Math.hypot(this.base.x, this.base.z) > OCT_APOTHEM - 1.1) { lateral += this.circleDir * 0.6; }
 
     this.desiredVel.set((ux * radial + px * lateral) * speed, 0, (uz * radial + pz * lateral) * speed);
   }
 
+  /** Pick an attack: kicks, or (on harder levels) whatever beats your habits. */
+  chooseCombo() {
+    const d = this.diff;
+    if (d.adapt > 0 && Math.random() < d.adapt) {
+      let best = null, top = 1.5;
+      for (const [k, v] of Object.entries(this.habits)) if (v > top) { best = k; top = v; }
+      if (best) return [...pick(READS[best])];
+    }
+    if (Math.random() < d.kick) return [...pick(KICK_COMBOS)];
+    return [...pick(COMBOS)];
+  }
+
+  /** Your defensive move, seen by the AI (it learns your habits on harder levels). */
+  noteHabit(kind) { if (kind in this.habits) this.habits[kind] += 1; }
+
+  /** You missed, or he blocked: a chance to punish it straight away. */
+  onOpening(time) {
+    if (this.mode !== 'fight' || this.staggerT > 0 || Math.random() > this.diff.counter) return;
+    this.tactic = 'combo';
+    this.comboQueue = [...pick(COUNTERS)];
+    this.attackCd = 0;
+    this.lastPunchAt = time - 1;
+  }
+
   startPunch(name, ctx) {
     const def = PUNCHES[name];
+    const tele = this.diff.telegraph;
+    if (def.kind === 'kick') {
+      if (this.kickSlot.punch) return false;
+      const tgt = def.aim === 'legs' ? ctx.playerLegs : ctx.playerChest;
+      this.kickSlot.punch = { def, name, t: 0, wind: def.wind + tele, aim: tgt.clone(), phase: 'wind', hit: false,
+        foot: def.side > 0 ? 'footL' : 'footR' };
+      this.lastPunchAt = ctx.time;
+      return true;
+    }
     const hand = def.side > 0 ? this.hands.L : this.hands.R;
     if (hand.punch) return false;
     const tgt = def.aim === 'head' ? ctx.playerHead : ctx.playerChest;
     const a = this.diff.accuracy;
     const aim = tgt.clone().add(new THREE.Vector3((Math.random() - 0.5) * 2 * a, (Math.random() - 0.5) * 2 * a, (Math.random() - 0.5) * 2 * a));
-    hand.punch = { def, name, t: 0, wind: def.wind + this.diff.telegraph * (name === 'jab' ? 0.8 : 1), aim, phase: 'wind', hit: false };
+    // the superman's wind-up is long and obvious: that's the trade-off for its damage
+    const wind = def.wind + tele * (name === 'jab' ? 0.8 : def.kind === 'superman' ? 2 : 1);
+    hand.punch = { def, name, t: 0, wind, aim, phase: 'wind', hit: false,
+      feint: def.kind !== 'superman' && Math.random() < this.diff.feint };
     this.lastPunchAt = ctx.time;
     return true;
   }
 
-  isPunching() { return this.handList.some((h) => h.punch && h.punch.phase === 'ext'); }
+  isPunching() { return this.handList.some((h) => h.punch && h.punch.phase === 'ext') || this.kickSlot.punch?.phase === 'ext'; }
 
-  takeHit(dmg, region) {
+  /** dmg: health. extra.cons / extra.bal: consciousness and balance lost (defaults from region). */
+  takeHit(dmg, region, extra = {}) {
     this.health = Math.max(0, this.health - dmg);
-    if (region === 'head') this.daze += dmg * 0.035;
-    else this.winded = Math.min(1, (this.winded || 0) + dmg * 0.05);
+    this.cons = Math.max(0, this.cons - (extra.cons ?? (region === 'head' ? dmg * 1.7 : dmg * 0.35)));
+    this.balance -= (extra.bal || 0) * (1 + 0.8 * (1 - this.cons / 100));   // dazed fighters are easier to sweep
+    this.lastHitT = this.clock;
+    if (region !== 'head') this.winded = Math.min(1, (this.winded || 0) + dmg * 0.05);
+    if (this.balance <= 0 && this.mode === 'fight' && this.cons > 0 && this.health > 0) { this.trip(); return; }
     if (dmg > 5) {
-      for (const h of this.handList) if (h.punch && h.punch.phase !== 'ret') { h.punch.interrupted = true; h.punch.t = h.punch.wind + h.punch.def.ext; }
+      for (const h of [...this.handList, this.kickSlot]) if (h.punch && h.punch.phase !== 'ret') { h.punch.interrupted = true; h.punch.t = h.punch.wind + h.punch.def.ext; }
       this.comboQueue = [];
       this.staggerT = 0.12 + dmg * 0.015;
       if (Math.random() < 0.5) this.coverT = 0.6;
@@ -520,16 +669,28 @@ export class Opponent {
     this.mode = 'down';
     this.knockdowns = (this.knockdowns || 0) + 1;
     for (const h of this.handList) h.punch = null;
+    this.kickSlot.punch = null;
     this.comboQueue = [];
   }
 
-  rise(health) {
+  /** Swept off his feet: down briefly, then straight back up (no count). */
+  trip() {
+    this.mode = 'tripped';
+    this.tripT = 0;
+    this.balance = 70;
+    for (const h of this.handList) h.punch = null;
+    this.kickSlot.punch = null;
+    this.comboQueue = [];
+    this.onTrip?.(this);
+  }
+
+  rise(health, fromTrip = false) {
     this.mode = 'rising';
     this.health = health;
-    this.daze = 0.4;
+    if (!fromTrip) this.cons = Math.max(this.cons, 60);
+    this.balance = Math.max(this.balance, 80);
     this.base.set(this.p.pelvis.pos.x, 0, this.p.pelvis.pos.z);
-    this.base.x = Math.max(-2.5, Math.min(2.5, this.base.x));
-    this.base.z = Math.max(-2.5, Math.min(2.5, this.base.z));
+    clampToOctagon(this.base, 0.9);
   }
 }
 
@@ -558,7 +719,7 @@ class FighterView {
     const shorts = new THREE.MeshStandardMaterial({ color: 0x9c1020, roughness: 0.4, metalness: 0.1 });
     const trim = new THREE.MeshStandardMaterial({ color: 0xf2e6c8, roughness: 0.5 });
     const glove = new THREE.MeshPhysicalMaterial({ color: 0x141414, roughness: 0.35, clearcoat: 0.8, clearcoatRoughness: 0.25 });
-    const shoe = new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.6 });
+    const shoe = new THREE.MeshStandardMaterial({ color: 0xb87a55, roughness: 0.6, emissive: 0xff3010, emissiveIntensity: 0 });   // bare feet
     const dark = new THREE.MeshStandardMaterial({ color: 0x1b1210, roughness: 0.8 });
     const sphere = new THREE.SphereGeometry(1, 24, 16);
     const cyl = new THREE.CylinderGeometry(1, 1, 1, 12);
@@ -608,16 +769,19 @@ class FighterView {
     for (const side of ['L', 'R']) {
       const g = new THREE.Group(); this.group.add(g);
       const mat = glove.clone();
-      const body = add(sphere, mat, g); body.scale.set(0.1, 0.095, 0.125);
+      const body = add(sphere, mat, g); body.scale.set(0.074, 0.068, 0.088);
       const thumb = add(sphere, mat, g); thumb.scale.set(0.035, 0.04, 0.06);
       thumb.position.set(side === 'L' ? -0.07 : 0.07, 0.04, 0.02);
-      const cuff = add(cyl, trim, g); cuff.scale.set(0.07, 0.09, 0.07); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.12;
+      const cuff = add(cyl, shorts, g); cuff.scale.set(0.058, 0.07, 0.058); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.085;
       this.gloves.push({ g, mat, handState: f.hands[side], hand: f.p['hand' + side], elbow: f.p['elbow' + side] });
     }
     this.shoes = [];
     for (const side of ['L', 'R']) {
-      const s = add(new THREE.BoxGeometry(0.1, 0.08, 0.25), shoe);
-      this.shoes.push({ m: s, foot: f.p['foot' + side], knee: f.p['knee' + side] });
+      const mat = shoe.clone();
+      const s = add(new THREE.BoxGeometry(0.09, 0.06, 0.22), mat);
+      // MMA fight shorts come down to mid-thigh
+      const leg = add(cyl, shorts);
+      this.shoes.push({ m: s, mat, name: 'foot' + side, foot: f.p['foot' + side], knee: f.p['knee' + side], hip: f.p['hip' + side], leg });
     }
   }
 
@@ -675,6 +839,16 @@ class FighterView {
       s.m.quaternion.setFromRotationMatrix(_m);
       s.m.position.copy(s.foot.pos).addScaledVector(_bz, 0.05);
       s.m.position.y -= 0.02;
+      // the kicking foot glows as a warning, like his gloves
+      const k = this.f.kickSlot.punch;
+      const glow = k && k.foot === s.name ? (k.phase === 'wind' ? 0.5 + 2 * Math.min(1, k.t / k.wind) : k.phase === 'ext' ? 1.2 : 0) : 0;
+      s.mat.emissiveIntensity += (glow - s.mat.emissiveIntensity) * 0.35;
+      _bx.lerpVectors(s.hip.pos, s.knee.pos, 0.55);
+      _by.subVectors(_bx, s.hip.pos);
+      const len = _by.length() || 1e-4;
+      s.leg.position.addVectors(s.hip.pos, _bx).multiplyScalar(0.5);
+      s.leg.quaternion.setFromUnitVectors(Y, _by.multiplyScalar(1 / len));
+      s.leg.scale.set(0.1, len, 0.1);
     }
   }
 }

@@ -1,6 +1,6 @@
-# Knockout Physics — first-person physics boxing (browser)
+# Knockout Physics MMA — first-person physics fighting (browser)
 
-A first-person boxing game where the fighting is driven by physics, not canned animations.
+A first-person MMA game in an octagon where the fighting is driven by physics, not canned animations. (No wrestling, for now: it's all striking.)
 
 - **Your gloves** are 3 kg simulated bodies pulled toward punch targets by spring-damper (PD) "muscles", with arm length enforced by a distance constraint. Damage comes from the **actual impact speed** of the collision, so range, timing, footwork (stepping in adds speed) and stamina (tired = weaker muscles) all matter.
 - **The opponent** is an *active ragdoll*: 17 Verlet particles joined by 36 constraints, held upright by muscle springs toward an animated pose. Hits physically snap his head back. Head shots daze him (muscle tone drops, he wobbles), and at 0 health his tone goes to zero and he collapses under gravity, then has to push himself back up.
@@ -10,6 +10,10 @@ A first-person boxing game where the fighting is driven by physics, not canned a
 - **Knockout cam.** Every knockdown is replayed in slow motion from a third-person camera, using a recording of the last couple of seconds of the physics simulation.
 - **Ragdoll joint limits and self-collision.** Knees are hinges that can't bend backwards, the neck and spine have range limits, and every pair of body parts that isn't directly joined collides, so limbs can't pass through the body.
 - **Online play.** *Play online* lets you host a match with a short join code, or join one. On the claude.ai page open matches are also listed. Each fighter decides whether a punch reached their own head and reports it back, so a dodge that worked on your screen always counts. The host keeps the match clock.
+- **Consciousness** (the gold bar under each fighter's health): head shots drain it fast, blocked shots a little, and it recovers when you stop getting hit. The lower it is the less stable you are: your view sways and blurs, your feet wander and your hands slow down; he wobbles. At zero you're knocked down, whatever your health.
+- **Kicks** use real legs and wreck **balance**: a few leg kicks sweep a fighter off his feet (he's back up a moment later, no count). Jump over low kicks.
+- **Difficulty** runs from Easy to **Expert** and **Champion**: the harder levels feint, punish your misses and blocked shots, throw superman punches, and read your habits (duck a lot and he'll uppercut; slip a lot and he'll hook; shell up and he'll kick your legs).
+- **Knockout cam and highlight reel.** Your actions are grouped into combos as you fight. Good ones are kept for the highlight reel at the end of the match, and a knockdown replays its whole combo, slowing down at each key moment (a duck, a slip, a block) and going ultra slow-mo on the final blow.
 - Press **V** in-game to see the physics skeleton (particles + constraints).
 
 ## Run it
@@ -57,20 +61,23 @@ On the claude.ai page the game uses the artifact `room` capability instead, whic
 
 | Input | Action |
 |---|---|
-| Mouse | Look / aim punches |
+| Mouse | Look / aim |
 | LMB / RMB | Left jab / right cross |
-| Q / E | Left hook / right hook |
+| Q / E | Left / right hook |
 | Shift + Q / E | Left / right body hook |
 | Z / X | Left / right uppercut |
-| Space (hold) | Guard (blocks clean shots, but drains stamina and some damage gets through) |
-| Shift + LMB / RMB | Slip left / right |
+| Shift + Z / X | Left / right kick |
+| Shift (hold) | Guard (blocks clean shots, but drains stamina and some damage and consciousness get through) |
+| Space | Jump. Punch while in the air for a **superman punch** (huge damage, big telegraph) |
+| Alt + A / D | Slip and sidestep left / right |
+| Alt + W / S | Dash in / out |
 | C (hold) | Duck |
 | WASD | Footwork |
 | V | Physics debug view |
 | M | Mute |
 | Esc or P | Pause / leave the match |
 
-**Phones and tablets** (hold it sideways): left thumb moves (the stick appears where you touch), drag on the right side to look. The **LEFT** and **RIGHT** buttons throw with each glove: tap for a jab / cross, swipe sideways for a hook, up for an uppercut, down for a body hook. Hold **GUARD** or **DUCK**, tap **◀ SLIP ▶** to slip, and tap any button to get up after a knockdown. **II** pauses.
+**Phones and tablets** (hold it sideways): left thumb moves (the stick appears where you touch), drag on the right side to look. The **LEFT** and **RIGHT** buttons throw with each glove: tap for a jab / cross, swipe sideways for a hook, up for an uppercut, down for a body hook. **KICK**: tap for a right kick, swipe left for a left kick. **JUMP**, then punch for a superman punch. Hold **GUARD** or **DUCK**, tap **◀ SLIP ▶** to slip and sidestep, and tap any button to get up after a knockdown. **II** pauses.
 
 3 rounds × 90 s. Knockout = no get-up by the count of 10; a third knockdown ends it. Otherwise it goes to a decision on damage.
 
@@ -81,7 +88,7 @@ On the claude.ai page the game uses the artifact `room` capability instead, whic
 | `src/physics.js` | Verlet engine: particles, distance constraints (equal / max / min), floor friction, sphere and segment contacts with impulses, two-bone IK |
 | `src/fighter.js` | Opponent ragdoll, muscle controller, AI (stalk / combo / retreat, blocking and slipping), visuals |
 | `src/player.js` | First-person controller, PD-driven gloves, punch trajectories, head-recoil springs |
-| `src/arena.js` | Ring, physical ropes, lights, crowd |
+| `src/arena.js` | Octagon cage, lights, crowd |
 | `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, rounds / knockdowns, knockout cam, online match flow, HUD, input |
 | `src/net.js` | Hosting and joining matches: claude.ai `room` capability, or PeerJS (WebRTC) everywhere else, with retries and reconnects |
 | `src/touch.js` | On-screen controls for phones and tablets |

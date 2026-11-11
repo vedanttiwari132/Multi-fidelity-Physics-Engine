@@ -8,16 +8,21 @@
 
 import * as THREE from 'three';
 import { Particle, DistanceConstraint, solveTwoBone } from './physics.js';
+import { clampToOctagon } from './arena.js';
 
 export const PUNCHES = {
   straight: { wind: 0.0, ext: 0.14, ret: 0.2, cost: 8, power: 1.0 },
   hook:     { wind: 0.06, ext: 0.18, ret: 0.22, cost: 12, power: 1.15 },
   uppercut: { wind: 0.07, ext: 0.16, ret: 0.22, cost: 12, power: 1.15 },
   bodyhook: { wind: 0.06, ext: 0.18, ret: 0.24, cost: 12, power: 1.1 },
+  // thrown from a jump: huge, but slow to recover and very visible
+  superman: { wind: 0.0, ext: 0.2, ret: 0.3, cost: 18, power: 1.6 },
 };
+/** Roundhouse kick with a real leg: chamber, swing through, recover. */
+export const KICK = { wind: 0.12, ext: 0.2, ret: 0.3, cost: 15, power: 1.3 };
+const LEG = 1.05;   // hip to foot, fully extended
 
 const ARM = 0.72;
-const RING = 2.85;
 const smooth = (u) => u * u * (3 - 2 * u);
 const _v = new THREE.Vector3();
 const _f = new THREE.Vector3();
@@ -49,12 +54,15 @@ export class Player {
     this.sensitivity = 0.0022;
     this.onPunch = null;  // (glove, type) => void  (punch started)
     this.onSwing = null;  // (glove) => void        (punch accelerating)
+    this.onJump = null;   // () => void
+    this.onDash = null;   // (dir) => void
+    this.legPos = new THREE.Vector3();   // thighs and knees: what low kicks hit
 
     this.headAnchor = world.addParticle(new Particle(new THREE.Vector3(), { mass: 0, radius: 0.12, name: 'playerHead' }));
     this.gloves = [-1, 1].map((side) => {
       const shoulder = world.addParticle(new Particle(new THREE.Vector3(), { mass: 0, name: 'playerShoulder' }));
       const particle = world.addParticle(new Particle(new THREE.Vector3(), {
-        mass: 3, radius: 0.105, gravityScale: 0, friction: 0.3, damping: 0.004, name: side < 0 ? 'gloveL' : 'gloveR',
+        mass: 3, radius: 0.09, gravityScale: 0, friction: 0.3, damping: 0.004, name: side < 0 ? 'gloveL' : 'gloveR',
       }));
       particle.isPlayerGlove = true;
       world.addConstraint(new DistanceConstraint(shoulder, particle, { length: ARM, mode: 'max' }));
@@ -64,7 +72,14 @@ export class Player {
       return g;
     });
     world.addConstraint(new DistanceConstraint(this.gloves[0].particle, this.gloves[1].particle, { length: 0.2, mode: 'min' }));
+    // The kicking leg: a heavy foot driven like a glove, on a rope-length leg from the hip.
+    const hip = world.addParticle(new Particle(new THREE.Vector3(), { mass: 0, name: 'playerHip' }));
+    const foot = world.addParticle(new Particle(new THREE.Vector3(), { mass: 6, radius: 0.09, gravityScale: 0, friction: 0.3, damping: 0.004, name: 'playerFoot' }));
+    world.addConstraint(new DistanceConstraint(hip, foot, { length: LEG, mode: 'max' }));
+    this.leg = { side: 1, shoulder: hip, particle: foot, punch: null, queued: null, target: new THREE.Vector3(), lastTarget: new THREE.Vector3(), omega: 18, maxAcc: 200, isLeg: true };
+    foot.glove = this.leg;
     this.view = new GloveView(scene, this);
+    this.legView = new LegView(scene, this);
     this.avatar = new PlayerAvatar(scene, this);
     this.reset(0, 1.6, 0);
   }
@@ -77,19 +92,80 @@ export class Player {
     this.health = 100; this.stamina = 100; this.knockdowns = 0;
     this.mode = 'idle'; this.downT = 0; this.recover = 0; this.fall = 0;
     this.dodge = null; this.dodgeCd = 0; this.dodgeOff.set(0, 0, 0); this.punchDuck = 0; this.punchDuckT = 0;
-    for (const g of this.gloves) { g.punch = null; g.queued = null; }
+    this.jumpY = 0; this.jumpV = 0; this.dashT = 0; this.dashCd = 0; this.tripT = 0;
+    this.cons = 100; this.balance = 100; this.lastHitT = -10;
+    for (const g of [...this.gloves, this.leg]) { g.punch = null; g.queued = null; }
     this.preStep(1 / 240);
-    for (const g of this.gloves) { g.particle.teleport(g.target); g.particle.force.set(0, 0, 0); g.lastTarget.copy(g.target); }
+    for (const g of [...this.gloves, this.leg]) { g.particle.teleport(g.target); g.particle.force.set(0, 0, 0); g.lastTarget.copy(g.target); }
   }
 
   resetKeepHealth(x, z, yaw) {
-    const { health, knockdowns } = this;
+    const { health, knockdowns, cons } = this;
     this.reset(x, z, yaw);
-    this.health = health; this.knockdowns = knockdowns;
+    this.health = health; this.knockdowns = knockdowns; this.cons = Math.max(60, cons);
   }
 
   get staminaFactor() { return 0.45 + 0.55 * (this.stamina / 100); }
-  get guarding() { return this.mode === 'fight' && this.keys.has('Space'); }
+  get guarding() { return this.mode === 'fight' && (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight')); }
+  get airborne() { return this.jumpY > 0.04; }
+  /** 0 = fully alert, 1 = out on your feet. */
+  get instability() { return Math.pow(1 - this.cons / 100, 1.5); }
+
+  requestJump() {
+    if (this.mode !== 'fight' || this.airborne || this.jumpV > 0 || this.duck > 0.1 || this.stamina < 5) return false;
+    this.stamina -= 5;
+    this.jumpV = 3.4 * (0.75 + 0.25 * this.cons / 100);
+    this.onJump?.();
+    return true;
+  }
+
+  /** Alt + direction: a quick burst of footwork. Left/right also slips your head. */
+  requestDash(dir) {
+    if (this.mode !== 'fight' || this.dashCd > 0 || this.stamina < 8 || this.airborne) return false;
+    this.stamina -= 8;
+    const sy = Math.sin(this.yaw), cy = Math.cos(this.yaw);
+    const [lx, lz] = { forward: [0, 1], back: [0, -1], left: [-1, 0], right: [1, 0] }[dir];
+    const speed = dir === 'left' || dir === 'right' ? 3.2 : 4.2;
+    this.vel.x += (lx * cy - lz * sy) * speed;
+    this.vel.z += (-lx * sy - lz * cy) * speed;
+    this.dashT = 0.22; this.dashCd = 0.4;
+    if (dir === 'left' || dir === 'right') { this.dodgeCd = 0; this.requestDodge(dir); }
+    this.onDash?.(dir);
+    return true;
+  }
+
+  /** side: -1 left leg, +1 right leg. */
+  requestKick(side) {
+    if (this.mode !== 'fight') return;
+    this.leg.queued = side;
+  }
+
+  startKick(side) {
+    const tired = this.stamina < KICK.cost;
+    this.stamina = Math.max(0, this.stamina - KICK.cost);
+    this.punchSeq = (this.punchSeq || 0) + 1;
+    this.leg.side = side;
+    this.leg.punch = { type: 'kick', def: KICK, t: 0, phase: 'wind', done: false, power: KICK.power * (tired ? 0.6 : 1), seq: this.punchSeq };
+    this.onPunch?.(this.leg, 'kick');
+  }
+
+  /** Lose consciousness and balance (both recover over time). */
+  hurt(cons, balance = 0) {
+    this.cons = Math.max(0, this.cons - cons);
+    // the more dazed you are, the easier you are to sweep
+    this.balance -= balance * (1 + 0.8 * (1 - this.cons / 100));
+    this.lastHitT = this.clock;
+    if (this.balance <= 0 && this.mode === 'fight' && this.cons > 0 && this.health > 0) this.trip();
+  }
+
+  /** Swept off your feet: down for a moment, then straight back up (no count). */
+  trip() {
+    this.mode = 'tripped';
+    this.tripT = 0;
+    this.balance = 70;
+    for (const g of [...this.gloves, this.leg]) { g.punch = null; g.queued = null; }
+    this.onTrip?.();
+  }
 
   look(dx, dy) {
     if (this.mode === 'down') return;
@@ -114,11 +190,13 @@ export class Player {
   get dodging() { return !!this.dodge && this.dodge.t < 0.65; }
 
   startPunch(g, type) {
+    if (type === 'straight' && this.airborne) type = 'superman';   // jump + punch
     const def = PUNCHES[type];
     const tired = this.stamina < def.cost;
     this.stamina = Math.max(0, this.stamina - def.cost);
     this.punchSeq = (this.punchSeq || 0) + 1;
     g.punch = { type, def, t: 0, phase: 'wind', done: false, power: def.power * (tired ? 0.6 : 1), seq: this.punchSeq };
+    if (type === 'superman') this.supermanAt = this.clock;
     this.onPunch?.(g, type);
   }
 
@@ -140,13 +218,35 @@ export class Player {
     let wx = fx * cy - fz * sy, wz = -fx * sy - fz * cy;
     const wl = Math.hypot(wx, wz);
     if (wl > 1) { wx /= wl; wz /= wl; }
-    const maxSp = (this.guarding ? 1.5 : 2.3) * (0.7 + 0.3 * this.stamina / 100);
-    const ka = 1 - Math.exp(-h * 10);
-    this.vel.x += (wx * maxSp - this.vel.x) * ka;
-    this.vel.z += (wz * maxSp - this.vel.z) * ka;
+    // dazed: your legs wander
+    const inst = this.instability;
+    if (active && inst > 0.05) {
+      wx += Math.sin(this.clock * 0.83) * 0.7 * inst;
+      wz += Math.cos(this.clock * 0.61 + 1.3) * 0.7 * inst;
+    }
+    const kicking = !!this.leg.punch;
+    const maxSp = (this.guarding ? 1.5 : 2.3) * (0.7 + 0.3 * this.stamina / 100) * (kicking ? 0.35 : 1) * (1 - 0.35 * inst);
+    this.dashT -= h; this.dashCd -= h;
+    if (this.dashT <= 0) {
+      const ka = 1 - Math.exp(-h * (this.airborne ? 1.5 : 10));   // little control in the air
+      this.vel.x += (wx * maxSp - this.vel.x) * ka;
+      this.vel.z += (wz * maxSp - this.vel.z) * ka;
+    }
     this.pos.addScaledVector(this.vel, h);
-    if (Math.abs(this.pos.x) > RING) { this.pos.x = Math.sign(this.pos.x) * RING; this.vel.x *= -0.2; }
-    if (Math.abs(this.pos.z) > RING) { this.pos.z = Math.sign(this.pos.z) * RING; this.vel.z *= -0.2; }
+    if (clampToOctagon(this.pos, 0.35) > 0) this.vel.multiplyScalar(0.5);   // the fence stops you
+
+    // jumping
+    if (this.jumpY > 0 || this.jumpV > 0) {
+      this.jumpV -= 9.81 * h;
+      this.jumpY += this.jumpV * h;
+      if (this.jumpY <= 0) { this.jumpY = 0; this.jumpV = 0; }
+    }
+
+    // consciousness and balance recover when you stop getting hit
+    if (this.mode === 'fight' || this.mode === 'idle') {
+      if (this.clock - this.lastHitT > 2) this.cons = Math.min(100, this.cons + h * 6 * (0.4 + 0.6 * this.health / 100));
+      if (!kicking) this.balance = Math.min(100, this.balance + h * 30 * (0.5 + 0.5 * this.cons / 100));
+    }
     const sp = Math.hypot(this.vel.x, this.vel.z);
     this.bobPhase += sp * h * 7;
 
@@ -181,8 +281,12 @@ export class Player {
     this.rotVel.addScaledVector(this.rotOff, -110 * h).multiplyScalar(Math.exp(-h * 8));
     this.rotOff.addScaledVector(this.rotVel, h);
 
-    // --- knockdown animation
-    if (this.mode === 'down') this.fall = Math.min(1, this.fall + h / 0.7);
+    // --- knockdown / sweep animation
+    if (this.mode === 'tripped') {
+      this.tripT += h;
+      this.fall = Math.min(1, this.fall + h / 0.35);
+      if (this.tripT > 1.5) this.mode = 'rising';
+    } else if (this.mode === 'down') this.fall = Math.min(1, this.fall + h / 0.7);
     else if (this.mode === 'rising') {
       this.fall = Math.max(0, this.fall - h / 1.1);
       if (this.fall <= 0) this.mode = 'fight';
@@ -190,7 +294,7 @@ export class Player {
     const fallE = smooth(this.fall);
 
     const height = THREE.MathUtils.lerp(this.standHeight - this.duck + this.dodgeOff.y + Math.sin(this.bobPhase * 2) * 0.012 * Math.min(1, sp) +
-      Math.sin(this.clock * 2.2) * 0.004, 0.45, fallE);
+      Math.sin(this.clock * 2.2) * 0.004, 0.45, fallE) + this.jumpY;
     const fwx = -sy, fwz = -cy;
     const dxw = cy * this.dodgeOff.x - fwx * this.dodgeOff.z, dzw = -sy * this.dodgeOff.x - fwz * this.dodgeOff.z;
     this.headBase.set(this.pos.x + fwx * this.lunge + dxw, height, this.pos.z + fwz * this.lunge + dzw);
@@ -199,6 +303,8 @@ export class Player {
     this.armBase.set(this.headBase.x - dxw * 0.65, this.headBase.y - this.dodgeOff.y * 0.5, this.headBase.z - dzw * 0.65);
     this.chestPos.set(this.pos.x + (fwx * this.lunge + dxw) * 0.5, height - 0.42, this.pos.z + (fwz * this.lunge + dzw) * 0.5);
     this.headVel.copy(this.vel).add(this.headOffVel);
+    this.headVel.y += this.jumpV;
+    this.legPos.set(this.pos.x, 0.55 + this.jumpY, this.pos.z);
 
     // --- shoulders follow the torso (yaw + twist only)
     _qy.setFromEuler(_e.set(0, this.yaw + this.twist, 0));
@@ -208,8 +314,19 @@ export class Player {
       g.shoulder.moveKinematic(_v);
     }
 
+    // --- the kicking leg hangs from the hip
+    // the hip turns over into a kick, bringing it forward
+    _v.set(this.leg.punch ? this.leg.side * 0.08 : 0, -0.72, this.leg.punch ? -0.14 : 0.02).applyQuaternion(_qy).add(this.armBase);
+    _v.y = Math.max(0.5, this.headBase.y - 0.75);
+    this.leg.shoulder.moveKinematic(_v);
+    if (this.leg.queued && !this.leg.punch && this.mode === 'fight' && !this.airborne) { this.startKick(this.leg.queued); }
+    this.leg.queued = null;
+
     // --- gloves
     this.lungeT = 0; this.twistT = 0; this.punchDuckT = 0;
+    this.legTarget(this.leg, h, _t);
+    this.leg.target.copy(_t).applyQuaternion(_qf).add(this.armBase);
+    this.driveGlove(this.leg, h);
     for (const g of this.gloves) {
       if (g.queued && (!g.punch || (g.punch.phase === 'ret' && g.punch.t > g.punch.def.wind + g.punch.def.ext + 0.08))) {
         this.startPunch(g, g.queued);
@@ -230,9 +347,10 @@ export class Player {
     const guard = this.guarding;
     // A tired guard is a weak guard: heavy shots push your own gloves into your face.
     const sf = this.stamina / 100;
-    g.omega = guard ? 28 * (0.55 + 0.45 * sf) : 18;
-    g.maxAcc = guard ? 170 * (0.3 + 0.7 * sf) : 120;
-    if (this.mode === 'down' || this.mode === 'rising') { g.omega = 10; return out.set(s * 0.26, -0.55, -0.3); }
+    const alert = 0.55 + 0.45 * this.cons / 100;   // dazed hands are slow
+    g.omega = (guard ? 28 * (0.55 + 0.45 * sf) : 18) * (0.7 + 0.3 * alert);
+    g.maxAcc = (guard ? 170 * (0.3 + 0.7 * sf) : 120) * alert;
+    if (this.mode === 'down' || this.mode === 'rising' || this.mode === 'tripped') { g.omega = 10; return out.set(s * 0.26, -0.55, -0.3); }
     if (guard) out.set(s * 0.1, -0.05, -0.27);
     else out.set(s * 0.2, -0.17, -0.36);
 
@@ -247,11 +365,17 @@ export class Player {
       else if (pu.type === 'uppercut') { out.lerp(_a.set(s * 0.13, -0.45, -0.28), u); this.lungeT = -0.02; }
       else if (pu.type === 'bodyhook') { out.lerp(_a.set(s * 0.4, -0.42, -0.28), u); this.twistT = -s * 0.06; this.punchDuckT = 0.1; }
     } else if (pu.t < d.wind + d.ext) {
-      if (pu.phase !== 'ext') { pu.phase = 'ext'; this.onSwing?.(g); }
+      if (pu.phase !== 'ext') {
+        pu.phase = 'ext'; this.onSwing?.(g);
+        if (pu.type === 'superman') { this.vel.x += -Math.sin(this.yaw) * 3.2; this.vel.z += -Math.cos(this.yaw) * 3.2; }
+      }
       const u = smooth((pu.t - d.wind) / d.ext);
       g.omega = 42;
-      g.maxAcc = 240 * this.staminaFactor * pu.power;
-      if (pu.type === 'straight') {
+      g.maxAcc = 240 * this.staminaFactor * Math.min(1.4, pu.power) * alert;
+      if (pu.type === 'superman') {
+        out.set(s * 0.03, -0.08 - this.jumpY, -1.05);   // thrown down from the top of the jump
+        this.lungeT = 0.25; this.twistT = s * 0.08;
+      } else if (pu.type === 'straight') {
         out.set(s * 0.05, 0.0, -0.95);
         this.lungeT = 0.09; this.twistT = s * 0.05;
       } else if (pu.type === 'hook') {
@@ -261,7 +385,8 @@ export class Player {
       } else if (pu.type === 'bodyhook') {
         _a.set(s * 0.45, -0.42, -0.55); _b.set(-s * 0.25, -0.4, -0.72);
         out.lerpVectors(_a, _b, u);
-        this.lungeT = 0.16;   // step in: body shots are thrown from closer this.twistT = s * 0.1; this.punchDuckT = 0.12;
+        this.lungeT = 0.16;   // step in: body shots are thrown from closer
+        this.twistT = s * 0.1; this.punchDuckT = 0.12;
       } else {
         _a.set(s * 0.1, -0.35, -0.45); _b.set(s * 0.03, 0.18, -0.72);
         out.lerpVectors(_a, _b, u);
@@ -271,6 +396,40 @@ export class Player {
       pu.phase = 'ret';
       g.omega = 22;
     } else {
+      if (!pu.done) this.onMiss?.(g);
+      g.punch = null;
+    }
+    return out;
+  }
+
+  /** Kicking foot target in head-local coordinates (like gloveTarget). */
+  legTarget(g, h, out) {
+    const s = g.side;
+    g.omega = 16; g.maxAcc = 200;
+    out.set(s * 0.15, -1.42, -0.05);   // resting: down by your feet, out of the way
+    const pu = g.punch;
+    if (!pu) return out;
+    pu.t += h;
+    const d = pu.def;
+    if (pu.t < d.wind) {
+      pu.phase = 'wind';
+      out.lerp(_a.set(s * 0.4, -0.95, -0.15), smooth(pu.t / d.wind));   // chamber the knee
+      this.twistT = -s * 0.08;
+    } else if (pu.t < d.wind + d.ext) {
+      if (pu.phase !== 'ext') { pu.phase = 'ext'; this.onSwing?.(g); }
+      const u = smooth((pu.t - d.wind) / d.ext);
+      _a.set(s * 0.85, -0.88, -0.55); _b.set(-s * 0.4, -0.84, -1.2);   // swing through at thigh height
+      out.lerpVectors(_a, _b, u);
+      g.omega = 36;
+      g.maxAcc = 320 * this.staminaFactor * pu.power * (0.55 + 0.45 * this.cons / 100);
+      this.twistT = s * 0.18;
+      this.balance -= h * 25;   // standing on one leg
+    } else if (pu.t < d.wind + d.ext + d.ret) {
+      pu.phase = 'ret';
+      out.set(s * 0.3, -1.2, -0.2);
+      g.omega = 20;
+    } else {
+      if (!pu.done) this.onMiss?.(g);
       g.punch = null;
     }
     return out;
@@ -310,18 +469,22 @@ export class Player {
     this.mode = 'down';
     this.knockdowns++;
     this.recover = 0;
-    for (const g of this.gloves) { g.punch = null; g.queued = null; }
+    for (const g of [...this.gloves, this.leg]) { g.punch = null; g.queued = null; }
   }
 
-  rise(health) { this.mode = 'rising'; this.health = health; }
+  rise(health) { this.mode = 'rising'; this.health = health; this.cons = 60; this.balance = 80; }
 
   updateCamera(camera) {
     const fallE = smooth(this.fall);
+    // dazed: the world sways
+    const inst = this.instability, t = this.clock;
+    const swayP = (Math.sin(t * 1.3) + 0.5 * Math.sin(t * 2.9 + 1)) * 0.06 * inst;
+    const swayR = (Math.sin(t * 0.9 + 2) + 0.4 * Math.sin(t * 2.3)) * 0.1 * inst;
     camera.position.copy(this.headPos);
     camera.rotation.set(
-      this.pitch + this.rotOff.x - fallE * 0.35,
-      this.yaw + this.twist + this.rotOff.y,
-      this.rotOff.z + fallE * 0.9 - this.dodgeOff.x * 0.5,
+      this.pitch + this.rotOff.x - fallE * 0.35 + swayP,
+      this.yaw + this.twist + this.rotOff.y + swayR * 0.4,
+      this.rotOff.z + fallE * 0.9 - this.dodgeOff.x * 0.5 + swayR,
       'YXZ',
     );
   }
@@ -336,21 +499,23 @@ const _el = new THREE.Vector3(), _pole = new THREE.Vector3(), _up = new THREE.Ve
 class GloveView {
   constructor(scene, player) {
     this.player = player;
-    const leather = new THREE.MeshPhysicalMaterial({ color: 0xc8141c, roughness: 0.32, clearcoat: 0.9, clearcoatRoughness: 0.2 });
-    const white = new THREE.MeshStandardMaterial({ color: 0xf4f1ea, roughness: 0.7 });
+    // 4 oz MMA gloves: small black pad over the knuckles, open fingers, red wrist strap
+    const leather = new THREE.MeshPhysicalMaterial({ color: 0x15151a, roughness: 0.38, clearcoat: 0.7, clearcoatRoughness: 0.3 });
+    const strap = new THREE.MeshStandardMaterial({ color: 0xb3121c, roughness: 0.5 });
     const skin = new THREE.MeshStandardMaterial({ color: 0xd9a27c, roughness: 0.6 });
     const sphere = new THREE.SphereGeometry(1, 28, 20);
     const cyl = new THREE.CylinderGeometry(1, 1, 1, 14);
     this.items = player.gloves.map((g) => {
       const group = new THREE.Group();
-      const body = new THREE.Mesh(sphere, leather); body.scale.set(0.1, 0.095, 0.125);
-      const knuckle = new THREE.Mesh(sphere, leather); knuckle.scale.set(0.085, 0.07, 0.06); knuckle.position.set(0, 0.03, 0.06);
-      const thumb = new THREE.Mesh(sphere, leather); thumb.scale.set(0.035, 0.04, 0.065); thumb.position.set(-g.side * 0.07, 0.035, 0.02);
-      const cuff = new THREE.Mesh(cyl, white); cuff.scale.set(0.072, 0.11, 0.072); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.12;
-      group.add(body, knuckle, thumb, cuff);
-      const fore = new THREE.Mesh(cyl, white);
+      const body = new THREE.Mesh(sphere, leather); body.scale.set(0.072, 0.066, 0.085);
+      const knuckle = new THREE.Mesh(sphere, leather); knuckle.scale.set(0.068, 0.052, 0.045); knuckle.position.set(0, 0.022, 0.045);
+      const fingers = new THREE.Mesh(sphere, skin); fingers.scale.set(0.062, 0.03, 0.035); fingers.position.set(0, -0.035, 0.055);
+      const thumb = new THREE.Mesh(sphere, skin); thumb.scale.set(0.025, 0.028, 0.048); thumb.position.set(-g.side * 0.055, 0.0, 0.03);
+      const cuff = new THREE.Mesh(cyl, strap); cuff.scale.set(0.058, 0.07, 0.058); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.08;
+      group.add(body, knuckle, fingers, thumb, cuff);
+      const fore = new THREE.Mesh(cyl, skin);
       const upper = new THREE.Mesh(cyl, skin);
-      for (const m of [body, knuckle, thumb, cuff, fore, upper]) { m.castShadow = true; m.receiveShadow = true; }
+      for (const m of [body, knuckle, fingers, thumb, cuff, fore, upper]) { m.castShadow = true; m.receiveShadow = true; }
       scene.add(group, fore, upper);
       return { g, group, fore, upper };
     });
@@ -373,9 +538,38 @@ class GloveView {
       it.group.quaternion.setFromRotationMatrix(_m);
       it.group.position.copy(gp);
 
-      placeCylinder(it.fore, _el, _v.copy(gp).addScaledVector(_bz, -0.1), 0.05);
+      placeCylinder(it.fore, _el, _v.copy(gp).addScaledVector(_bz, -0.08), 0.045);
       placeCylinder(it.upper, sp, _el, 0.06);
     }
+  }
+}
+
+/** Your kicking leg, seen in first person while you kick. */
+class LegView {
+  constructor(scene, player) {
+    this.player = player;
+    const skin = new THREE.MeshStandardMaterial({ color: 0xd9a27c, roughness: 0.6 });
+    const shorts = new THREE.MeshStandardMaterial({ color: 0x1840c0, roughness: 0.45 });
+    const cyl = new THREE.CylinderGeometry(1, 1, 1, 12);
+    this.thigh = new THREE.Mesh(cyl, shorts);
+    this.shin = new THREE.Mesh(cyl, skin);
+    this.foot = new THREE.Mesh(new THREE.SphereGeometry(1, 14, 10), skin);
+    this.foot.scale.set(0.055, 0.05, 0.12);
+    for (const m of [this.thigh, this.shin, this.foot]) { m.castShadow = true; m.visible = false; scene.add(m); }
+  }
+
+  update(camera) {
+    const p = this.player, leg = p.leg;
+    const show = !!leg.punch;
+    this.thigh.visible = this.shin.visible = this.foot.visible = show;
+    if (!show) return;
+    const hip = leg.shoulder.pos, foot = leg.particle.pos;
+    _pole.set(leg.side * 0.4, 0.4, -1).applyQuaternion(camera.quaternion);   // knee leads the kick
+    solveTwoBone(hip, foot, 0.5, 0.55, _pole, _el);
+    placeCylinder(this.thigh, hip, _el, 0.085);
+    placeCylinder(this.shin, _el, foot, 0.06);
+    this.foot.position.copy(foot);
+    this.foot.quaternion.setFromUnitVectors(_bz.set(0, 0, 1), _v.subVectors(foot, _el).normalize());
   }
 }
 
@@ -429,8 +623,8 @@ class PlayerAvatar {
     this.shoulders = [add(sphere, skin), add(sphere, skin)];
     for (const m of this.shoulders) m.scale.setScalar(0.075);
     this.phase = 0;   // stepping cycle, advanced by how fast you move (same as the opponent's)
-    this.legs = [-1, 1].map(() => ({ thigh: add(cyl, skin), shin: add(cyl, skin), knee: add(sphere, skin),
-      shoe: add(new THREE.BoxGeometry(0.1, 0.08, 0.25), trim) }));
+    this.legs = [-1, 1].map(() => ({ thigh: add(cyl, skin), shorts: add(cyl, shorts), shin: add(cyl, skin), knee: add(sphere, skin),
+      shoe: add(new THREE.SphereGeometry(1, 12, 8), skin) }));   // MMA: barefoot, fight shorts to mid-thigh
   }
 
   tick(dt) {
@@ -447,7 +641,7 @@ class PlayerAvatar {
     const head = p.headAnchor.pos;
     const sL = p.gloves[0].shoulder.pos, sR = p.gloves[1].shoulder.pos;
     const sMid = _p3.addVectors(sL, sR).multiplyScalar(0.5);
-    const hip = _p4.set(p.pos.x, 0.93 - p.duck * 0.6 - p.punchDuck * 0.5, p.pos.z);
+    const hip = _p4.set(p.pos.x, 0.93 - p.duck * 0.6 - p.punchDuck * 0.5 + p.jumpY, p.pos.z);
     const up = _v.subVectors(sMid, hip);
 
     orient(this.chest, left, up); this.chest.position.copy(sMid).addScaledVector(_ay, -0.11);
@@ -469,14 +663,19 @@ class PlayerAvatar {
       const hipJ = _t.copy(hip).addScaledVector(left, side * 0.11);
       const shuffle = Math.cos(ph) * 0.08 * amt;
       const foot = _b.set(p.pos.x + left.x * side * 0.15 + fwd.x * fwdOff + mx * shuffle,
-        0.07 + Math.max(0, Math.sin(ph)) * 0.09 * amt,
+        0.07 + Math.max(0, Math.sin(ph)) * 0.09 * amt + p.jumpY,
         p.pos.z + left.z * side * 0.15 + fwd.z * fwdOff + mz * shuffle);
       _a.copy(fwd).addScaledVector(left, side * 0.25);
-      solveTwoBone(hipJ, foot, 0.41, 0.44, _a, _el);
+      // the kicking leg (left leg is side -1 in the player's own terms) follows the real foot
+      const kicking = p.leg.particle.pos.y > 0.3 && (p.leg.side < 0) === (side > 0);
+      if (kicking) { foot.copy(p.leg.particle.pos); _a.set(0, 0.5, 0).addScaledVector(fwd, 1); }
+      solveTwoBone(hipJ, foot, kicking ? 0.5 : 0.41, kicking ? 0.55 : 0.44, _a, _el);
       placeCylinder(leg.thigh, hipJ, _el, 0.08);
+      placeCylinder(leg.shorts, hipJ, _p3.lerpVectors(hipJ, _el, 0.55), 0.098);
       placeCylinder(leg.shin, _el, foot, 0.058);
       leg.knee.position.copy(_el); leg.knee.scale.setScalar(0.068);
-      leg.shoe.position.copy(foot).addScaledVector(fwd, 0.05); leg.shoe.position.y = foot.y - 0.02;
+      leg.shoe.position.copy(foot).addScaledVector(fwd, 0.04); leg.shoe.position.y = Math.max(0.04, foot.y - 0.02);
+      leg.shoe.scale.set(0.05, 0.045, 0.11);
       leg.shoe.rotation.set(0, yaw, 0);
     });
   }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
-  <title>Knockout Physics</title>
+  <title>Knockout Physics MMA</title>
   <style>
     :root { --blue: #3b82ff; --red: #ff3b3b; --gold: #ffd166; --ink: #f4f1ea; }
     * { box-sizing: border-box; }
@@ -30,6 +30,10 @@
     .fill.blue { background: linear-gradient(#6aa2ff, #1d5bd8); }
     .fill.red { background: linear-gradient(#ff7272, #c81818); }
     .fill.green { background: linear-gradient(#8ef08e, #29a329); }
+    .fill.gold { background: linear-gradient(#ffe48a, #d89a00); }
+    .bar.cons { height: 7px; margin-top: 4px; border-width: 1px; }
+    #p-cons.low { animation: blink 0.6s steps(2) infinite; }
+    #kc-sub { font-size: 13px; letter-spacing: 0.25em; font-style: normal; opacity: 0.75; margin-top: 4px; }
     .kd { margin-top: 6px; font-size: 12px; letter-spacing: 0.1em; color: var(--gold); min-height: 16px; text-shadow: 0 1px 3px #000; }
     .clock { text-align: center; min-width: 140px; background: rgba(0,0,0,0.55); border: 2px solid rgba(255,255,255,0.5);
       border-radius: 6px; padding: 4px 14px 6px; }
@@ -153,6 +157,8 @@
     .t-hold { width: 66px; height: 66px; font-size: 12px; }
     .t-small { width: auto; height: 38px; border-radius: 19px; padding: 0 14px; font-size: 12px; }
     .t-legend { font-size: 10px; opacity: 0.7; text-shadow: 0 1px 2px #000; }
+    .t-jump, .t-kick { width: 58px; height: 58px; font-size: 11px; }
+    .t-kick { align-self: center; }
     .t-pause { position: absolute; top: max(78px, calc(env(safe-area-inset-top, 0px) + 70px)); left: max(16px, env(safe-area-inset-left, 0px));
       width: 44px; height: 44px; font-size: 14px; }
     .t-stick { position: absolute; width: 120px; height: 120px; margin: -60px 0 0 -60px; border-radius: 50%;
@@ -190,12 +196,14 @@
       <div class="fighter left">
         <div class="name">YOU</div>
         <div class="bar"><div id="p-lag" class="lag"></div><div id="p-health" class="fill blue"></div></div>
+        <div class="bar cons" title="Consciousness"><div id="p-cons" class="fill gold"></div></div>
         <div id="p-kd" class="kd"></div>
       </div>
       <div class="clock"><div id="round">ROUND 1</div><div id="timer">1:30</div></div>
       <div class="fighter right">
         <div class="name" id="opp-name">"THE BRICK"</div>
         <div class="bar"><div id="o-lag" class="lag"></div><div id="o-health" class="fill red"></div></div>
+        <div class="bar cons" title="Consciousness"><div id="o-cons" class="fill gold"></div></div>
         <div id="o-kd" class="kd"></div>
       </div>
     </div>
@@ -208,7 +216,7 @@
     <div id="netwarn" hidden>CONNECTION LOST · RECONNECTING…</div>
     <div id="recover" class="hidden"><div id="recover-text">MASH SPACE TO GET UP</div><div class="bar"><div id="recover-fill"></div></div></div>
     <div class="bottom"><div class="label">STAMINA</div><div class="bar small"><div id="stamina" class="fill green"></div></div></div>
-    <div id="hint">LMB / RMB jab · cross &nbsp;|&nbsp; Q / E hooks &nbsp;|&nbsp; Shift+Q / E body hooks &nbsp;|&nbsp; Z / X uppercuts<br>Shift+click slip · Space guard · C duck · WASD move · V physics view · M mute</div>
+    <div id="hint">LMB / RMB jab · cross &nbsp;|&nbsp; Q / E hooks &nbsp;|&nbsp; Shift+Q / E body hooks &nbsp;|&nbsp; Z / X uppercuts &nbsp;|&nbsp; Shift+Z / X kicks<br>Shift guard · Space jump · Alt+WASD slip / dash · C duck · V physics view · M mute</div>
     <div id="debug-info"></div>
   </div>
   <div id="touch" hidden></div>
@@ -218,20 +226,23 @@
   <div id="kocam" class="hidden">
     <div class="lb lb-top"></div><div class="lb lb-bottom"></div>
     <div class="kc-tag">● REPLAY</div>
-    <div class="kc-title">KNOCKOUT CAM</div>
+    <div class="kc-title"><span id="kc-title-text">KNOCKOUT CAM</span><div id="kc-sub"></div></div>
     <div id="kc-caption"></div>
     <div class="kc-skip">click or Space to skip</div>
   </div>
 
   <div id="menu" class="overlay">
     <div class="panel">
-      <h1>KNOCKOUT<span>PHYSICS</span></h1>
-      <p class="tag">First-person, physics-driven boxing. Every punch is a real collision, so <b>speed, range and timing</b> decide the damage.
-        The glove he's about to throw glows, and the ring around your sights shows where it's coming from. Slip it and he's open for a counter.</p>
+      <h1>KNOCKOUT<span>PHYSICS MMA</span></h1>
+      <p class="tag">First-person, physics-driven MMA in the octagon. Every strike is a real collision, so <b>speed, range and timing</b> decide the damage.
+        Watch your <b>consciousness</b> (gold bar): head shots drain it and the lower it gets, the less steady you are. Kicks wreck balance and can sweep
+        a fighter off his feet. The limb he's about to throw glows, and the ring around your sights shows where it's coming from.</p>
       <div class="diff">
         <button data-diff="easy">EASY</button>
         <button data-diff="normal" class="sel">NORMAL</button>
         <button data-diff="hard">HARD</button>
+        <button data-diff="expert">EXPERT</button>
+        <button data-diff="champion">CHAMPION</button>
       </div>
       <button id="start" class="big">FIGHT</button>
       <button id="online-btn" class="big alt">PLAY ONLINE</button>
@@ -240,7 +251,9 @@
         <div class="k">Drag right side</div><div class="d">Look / aim</div>
         <div class="k">LEFT / RIGHT</div><div class="d">Tap: jab / cross · swipe sideways: hook · swipe up: uppercut · swipe down: body hook</div>
         <div class="k">GUARD · DUCK</div><div class="d">Hold</div>
-        <div class="k">◀ SLIP ▶</div><div class="d">Slip punches</div>
+        <div class="k">JUMP</div><div class="d">Jump (then punch for a superman punch)</div>
+        <div class="k">KICK</div><div class="d">Tap: right kick · swipe left: left kick</div>
+        <div class="k">◀ SLIP ▶</div><div class="d">Slip and sidestep</div>
       </div>
       <div class="controls desk-only">
         <div class="k"><kbd>Mouse</kbd></div><div class="d">Look / aim your punches</div>
@@ -248,8 +261,11 @@
         <div class="k"><kbd>Q</kbd> <kbd>E</kbd></div><div class="d">Left hook · right hook</div>
         <div class="k"><kbd>Shift</kbd>+<kbd>Q</kbd> <kbd>E</kbd></div><div class="d">Left · right body hook</div>
         <div class="k"><kbd>Z</kbd> <kbd>X</kbd></div><div class="d">Left · right uppercut</div>
-        <div class="k"><kbd>Space</kbd> (hold)</div><div class="d">Guard: stops clean shots, but drains stamina</div>
-        <div class="k"><kbd>Shift</kbd>+<kbd>LMB</kbd> <kbd>RMB</kbd></div><div class="d">Slip left · right</div>
+        <div class="k"><kbd>Shift</kbd>+<kbd>Z</kbd> <kbd>X</kbd></div><div class="d">Left · right kick (sweeps legs out)</div>
+        <div class="k"><kbd>Shift</kbd> (hold)</div><div class="d">Guard: stops clean shots, but drains stamina</div>
+        <div class="k"><kbd>Space</kbd></div><div class="d">Jump · punch in the air for a superman punch</div>
+        <div class="k"><kbd>Alt</kbd>+<kbd>A</kbd> <kbd>D</kbd></div><div class="d">Slip and sidestep left · right</div>
+        <div class="k"><kbd>Alt</kbd>+<kbd>W</kbd> <kbd>S</kbd></div><div class="d">Dash in · out</div>
         <div class="k"><kbd>C</kbd> (hold)</div><div class="d">Duck under punches</div>
         <div class="k"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div><div class="d">Footwork (stepping in adds power)</div>
         <div class="k"><kbd>V</kbd></div><div class="d">Toggle physics debug view</div>
@@ -292,6 +308,7 @@
       <h2 id="res-title">YOU WIN</h2>
       <div id="res-detail"></div>
       <div id="res-stats"></div>
+      <button id="highlights-btn" class="big alt" hidden>WATCH HIGHLIGHTS</button>
       <button id="again" class="big">REMATCH</button>
       <button id="to-menu">MENU</button>
     </div>

@@ -17,7 +17,6 @@ const STEP = 1 / 240;      // physics rate
 const MAX_STEPS = 16;
 const ROUND_TIME = 90;
 const ROUNDS = 3;
-const GLOVE_MASS = 3;
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------- setup
@@ -50,7 +49,7 @@ const game = {
   paused: false, overlay: false, noLock: false, vignette: 0, lagP: 100, lagO: 100, counterUntil: -1,
   stats: null,
 };
-const ctx = { playerPos: player.pos, playerHead: player.headPos, playerChest: player.chestPos, time: 0 };
+const ctx = { playerPos: player.pos, playerHead: player.headPos, playerChest: player.chestPos, playerLegs: player.legPos, time: 0 };
 
 function newStats() {
   return { thrown: 0, landed: 0, blocked: 0, dodged: 0, topSpeed: 0, topEnergy: 0, dealt: 0, taken: 0, oppThrown: 0, oppLanded: 0 };
@@ -60,16 +59,23 @@ game.stats = newStats();
 // ---------------------------------------------------------------- contacts
 const impulse = new THREE.Vector3();
 const BODY_PARTS = ['head', 'neck', 'chest', 'belly', 'pelvis', 'shoulderL', 'shoulderR', 'hipL', 'hipR', 'kneeL', 'kneeR'];
+const LEGS_RADIUS = 0.22;
+// his feet can block your strikes too, but only the foot he's kicking with counts as an attack
+opp.p.footL.kicker = opp.kickSlot; opp.p.footR.kicker = opp.kickSlot;
+const attackOf = (p) => p.hand?.punch || (p.kicker?.punch && p.kicker.punch.foot === p.name ? p.kicker.punch : null);
 
 world.collisionHook = (h, iter) => {
-  for (const g of player.gloves) {
-    // Body hooks swing around his arms unless he has dropped his guard to cover the body.
-    const aroundArms = g.punch && g.punch.type === 'bodyhook' && g.punch.phase !== 'ret' && !opp.coverLow;
-    // Resting gloves don't parry for you: his punches only meet your gloves when you hold guard or are punching.
+  const leg = player.leg;
+  const limbs = leg.punch && leg.punch.phase !== 'ret' ? [...player.gloves, leg] : player.gloves;
+  for (const g of limbs) {
+    const type = g.punch?.type;
+    // Body hooks and kicks go around his arms unless he has dropped his guard to cover the body.
+    const aroundArms = (type === 'bodyhook' || type === 'kick') && g.punch.phase !== 'ret' && !opp.coverLow;
+    // Resting gloves don't parry for you: his strikes only meet your gloves when you hold guard or are punching.
     const gloveActive = player.guarding || !!g.punch;
     for (const p of opp.list) {
       if (aroundArms && p.region === 'guard') continue;
-      if (p.hand && !gloveActive) continue;
+      if ((p.hand || attackOf(p)) && !gloveActive) continue;
       const s = collideParticles(g.particle, p, h, 0.15);
       if (s >= 0) onGloveContact(g, p, s);
     }
@@ -82,10 +88,21 @@ world.collisionHook = (h, iter) => {
       s = collideParticleSphere(hp, player.chestPos, 0.2, player.vel, 1 / 30, h, 0.1, impulse);
       if (s >= 0) onPlayerStruck(hand, s, impulse, 'body');
     }
+    // his kicks: mostly at your legs (jump over them), sometimes your body
+    const k = opp.kickSlot.punch;
+    if (k && player.mode !== 'down') {
+      const fp = opp.p[k.foot];
+      let s = collideParticleSphere(fp, player.legPos, LEGS_RADIUS, player.vel, 1 / 40, h, 0.1, impulse);
+      if (s >= 0) onPlayerStruck(opp.kickSlot, s, impulse, 'legs');
+      s = collideParticleSphere(fp, player.chestPos, 0.2, player.vel, 1 / 30, h, 0.1, impulse);
+      if (s >= 0) onPlayerStruck(opp.kickSlot, s, impulse, 'body');
+      s = collideParticleSphere(fp, player.headPos, player.headRadius, player.headVel, 1 / 5, h, 0.1, impulse);
+      if (s >= 0) onPlayerStruck(opp.kickSlot, s, impulse, 'head');
+    }
   }
   if (iter === 0) {
     bodyContact();
-    arena.collideRopes(opp.list, player);
+    if (arena.collideCage(opp.list, player) > 0.05 && opp.mode !== 'fight') arena.excitement += 0.02;
   }
 };
 
@@ -106,63 +123,87 @@ function bodyContact() {
 }
 
 function onGloveContact(g, p, speed) {
-  // Your glove intercepted one of his punches -> block
-  const hp = p.hand?.punch;
-  if (hp && !hp.hit && !hp.blocked && hp.phase === 'ext' && speed > 1) {
+  // Your glove intercepted one of his punches or kicks -> block
+  const hp = attackOf(p);
+  if (hp && !hp.hit && !hp.blocked && hp.phase === 'ext' && speed > 1 && !g.isLeg) {
     hp.blocked = true;
     game.stats.blocked++;
-    // Absorbing a punch costs more stamina than throwing one, and some of it still gets through.
-    // (A glove that merely gets in the way, without holding guard, costs less and lets nothing through.)
+    // Absorbing a strike costs more stamina than throwing one, and some of it still gets through:
+    // a little health and a little consciousness. (A glove that merely gets in the way, without
+    // holding guard, costs less and lets nothing through.)
     const guarded = player.guarding;
-    const drain = THREE.MathUtils.clamp(4 + speed * 1.3 * hp.def.power * opp.diff.power, 6, 20) * (guarded ? 1 : 0.5);
+    const kick = hp.def.kind === 'kick';
+    const drain = THREE.MathUtils.clamp(4 + speed * 1.3 * hp.def.power * opp.diff.power, 6, 20) * (guarded ? 1 : 0.5) * (kick ? 1.4 : 1);
     player.stamina = Math.max(0, player.stamina - drain);
     const chip = guarded ? Math.max(0, speed - 2.0) * 2.4 * opp.diff.damage * hp.def.power * 0.25 : 0;
     player.health = Math.max(0, player.health - chip);
+    player.hurt(chip * 0.8, kick ? 10 : 0);
     game.stats.taken += chip;
     game.vignette = Math.min(1, game.vignette + chip / 10);
     sfx.block(speed / 8);
     const broken = player.stamina <= 0;
-    if (!broken) hp.hit = true;   // guard held: no clean shot; broken guard: the glove can still reach your head
+    if (!broken) hp.hit = true;   // guard held: no clean shot; broken guard: the strike can still reach your head
     publishHit(hp, chip, 2, Math.max(speed, hp.speed || 0), 0, false);
     showImpact(broken ? 'GUARD BROKEN' : guarded ? 'BLOCKED' : 'PARRIED', `−${drain.toFixed(0)} stamina${chip ? ` · −${chip.toFixed(1)} health` : ''}`);
-    if (player.health <= 0 && player.mode === 'fight') playerKnockdown();
+    if (guarded) { logEvent('block', 'BLOCK'); if (!mp.on) opp.noteHabit('block'); }
+    if ((player.mode === 'fight' || player.mode === 'tripped') && (player.health <= 0 || player.cons <= 0)) playerKnockdown();
     return;
   }
   const pu = g.punch;
   if (!pu || pu.done || pu.phase === 'wind' || speed < 1.5) return;
   pu.done = true;
-  const mu = (GLOVE_MASS * p.mass) / (GLOVE_MASS + p.mass);
+  const mass = g.particle.mass;
+  const mu = (mass * p.mass) / (mass + p.mass);
   const energy = 0.5 * mu * speed * speed;
   if (mp.on) {   // online: the person you hit decides the damage and reports it back
-    if (p.region === 'guard') sfx.block(speed / 8); else sfx.punch(Math.min(1, speed / 9), p.region);
+    if (p.region === 'guard') sfx.block(speed / 8); else sfx.punch(Math.min(1, speed / 9), p.region === 'low' ? 'body' : p.region);
     return;
   }
   if (opp.mode !== 'fight') { sfx.punch(0.2, 'body'); return; }
-  if (p.region === 'guard') {
+  const isKick = pu.type === 'kick';
+  if (p.region === 'guard' && !isKick) {
     sfx.block(speed / 8);
     showImpact('BLOCKED', speed, energy);
     opp.coverT = Math.max(opp.coverT, 0.25);
+    opp.onOpening(game.time);   // he blocked it: his chance to fire back
     return;
   }
-  if (p.region === 'low') { sfx.punch(0.3, 'body'); showImpact('LOW', speed, energy); return; }
+  if (p.region === 'low' && !isKick) { sfx.punch(0.3, 'body'); showImpact('LOW', speed, energy); return; }
 
   const counter = opp.isPunching() || game.time < game.counterUntil;
-  const mult = p.region === 'head' ? 1 : pu.type === 'bodyhook' ? 0.9 : 0.6;
-  const dmg = Math.max(0, speed - 2.2) * 2.2 * pu.power * mult * (counter ? 1.25 : 1);
+  const cm = counter ? 1.25 : 1;
+  const v = Math.max(0, speed - 2.2) * pu.power;
+  let dmg, cons, bal = 0;
+  if (isKick) {
+    if (p.region === 'head') { dmg = v * 3.0; cons = dmg * 2.2; bal = 25; }         // head kick
+    else if (p.region === 'low') { dmg = v * 1.1; cons = 2; bal = v * 9; }           // leg kick: chops the legs out
+    else { dmg = v * 2.0 * (p.region === 'guard' ? 0.4 : 1); cons = dmg * 0.4; bal = v * 4; }
+  } else {
+    const mult = p.region === 'head' ? 1 : pu.type === 'bodyhook' ? 0.9 : 0.6;
+    dmg = v * 2.2 * mult;
+    cons = p.region === 'head' ? dmg * 1.6 : dmg * 0.35;
+    if (pu.type === 'superman') bal = 15;
+  }
+  dmg *= cm; cons *= cm;
   game.stats.landed++;
   game.stats.dealt += dmg;
   game.stats.topSpeed = Math.max(game.stats.topSpeed, speed);
   game.stats.topEnergy = Math.max(game.stats.topEnergy, energy);
-  opp.takeHit(dmg, p.region);
-  sfx.punch(speed / 9, p.region);
+  opp.takeHit(dmg, p.region, { cons, bal });
+  sfx.punch(Math.min(1.5, speed / 9 * (isKick ? 1.3 : 1)), p.region === 'low' ? 'body' : p.region);
   arena.excitement += dmg / 20;
-  const label = counter ? 'COUNTER!' : p.region === 'head' ? (dmg > 14 ? 'HUGE SHOT' : 'HEAD') : 'BODY SHOT';
+  const name = punchName(g, pu.type);
+  const swept = opp.mode === 'tripped';
+  const label = swept ? 'SWEPT!' : counter ? 'COUNTER!' : pu.type === 'superman' ? 'SUPERMAN!' : isKick ? (p.region === 'head' ? 'HEAD KICK' : p.region === 'low' ? 'LEG KICK' : 'BODY KICK')
+    : p.region === 'head' ? (dmg > 14 ? 'HUGE SHOT' : 'HEAD') : 'BODY SHOT';
   showImpact(label, speed, energy);
-  if (opp.health <= 0) oppKnockdown({ name: punchName(g, pu.type), speed, energy });
+  logEvent('hit', (counter ? 'COUNTER ' : '') + name, { dmg, speed, energy });
+  if (swept) { logEvent('sweep', 'SWEEP'); sfx.crowdCheer(1); }
+  if (opp.health <= 0 || opp.cons <= 0) oppKnockdown({ name: (counter ? 'COUNTER ' : '') + name, speed, energy });
 }
 
 function onPlayerStruck(hand, speed, imp, region) {
-  if (player.mode !== 'fight') { player.takeHit(imp, 0, region); return; }
+  if (player.mode !== 'fight') { player.takeHit(imp, 0, region === 'legs' ? 'body' : region); return; }
   const pu = hand.punch;
   let dmg = 0;
   // Only a glove still travelling forward does damage, not one on its way back.
@@ -170,18 +211,24 @@ function onPlayerStruck(hand, speed, imp, region) {
   if (pu?.mirror) speed = Math.max(speed, pu.speed || 0);   // online: use their real glove speed
   if (pu && !pu.hit && travelling && speed > 1.5) {
     pu.hit = true;
-    const counter = mp.on && (mp.rs?.ctr || player.gloves.some((g) => g.punch?.phase === 'ext'));
-    dmg = Math.max(0, speed - 2.0) * 2.4 * opp.diff.damage * pu.def.power * (region === 'head' ? 1 : 0.5) * (counter ? 1.25 : 1);
+    const kick = pu.def.kind === 'kick';
+    const counter = mp.on ? (mp.rs?.ctr || player.gloves.some((g) => g.punch?.phase === 'ext')) : false;
+    const v = Math.max(0, speed - 2.0) * opp.diff.damage * pu.def.power * (counter ? 1.25 : 1);
+    dmg = v * 2.4 * (region === 'head' ? 1 : region === 'legs' ? 0.3 : 0.5);
     if (region === 'body' && player.guarding) dmg *= 0.5;
-    publishHit(pu, dmg, region === 'head' ? 0 : 1, speed, 0.5 * (15 / 8) * speed * speed, counter);
+    const cons = region === 'head' ? dmg * 1.6 : region === 'body' ? dmg * 0.3 : 1;
+    const bal = kick ? (region === 'legs' ? v * 8 : v * 4) : pu.def.kind === 'superman' ? 12 : 0;
+    player.hurt(cons, bal);
+    publishHit(pu, dmg, region === 'head' ? 0 : region === 'legs' ? 3 : 1, speed, 0.5 * (15 / 8) * speed * speed, counter, player.mode === 'tripped');
     game.stats.taken += dmg;
     game.stats.oppLanded++;
-    sfx.punch(speed / 9, region);
+    sfx.punch(speed / 9, region === 'legs' ? 'body' : region);
     game.vignette = Math.min(1, game.vignette + dmg / 16);
     arena.excitement += dmg / 25;
+    if (player.mode === 'tripped') { banner('SWEPT!'); sfx.crowdCheer(0.8); }
   }
-  player.takeHit(imp, dmg, region);
-  if (player.health <= 0) playerKnockdown();
+  player.takeHit(imp, dmg, region === 'legs' ? 'body' : region);
+  if ((player.mode === 'fight' || player.mode === 'tripped') && (player.health <= 0 || player.cons <= 0)) playerKnockdown();
 }
 
 // ---------------------------------------------------------------- rules
@@ -203,6 +250,7 @@ function startMatch() {
   game.stats = newStats();
   game.round = 1;
   game.lagP = game.lagO = 100;
+  combo.cur = null; combo.clips = [];
   $('menu').classList.add('hidden');
   $('results').classList.add('hidden');
   $('hud').classList.remove('hidden');
@@ -236,7 +284,8 @@ function endRound() {
 
 function punchName(g, type) {
   const side = g.side < 0 ? 'LEFT' : 'RIGHT';
-  return { straight: g.side < 0 ? 'JAB' : 'CROSS', hook: `${side} HOOK`, uppercut: `${side} UPPERCUT`, bodyhook: `${side} BODY HOOK` }[type];
+  return { straight: g.side < 0 ? 'JAB' : 'CROSS', hook: `${side} HOOK`, uppercut: `${side} UPPERCUT`, bodyhook: `${side} BODY HOOK`,
+    kick: `${side} KICK`, superman: 'SUPERMAN PUNCH' }[type];
 }
 
 function oppKnockdown(info) {
@@ -249,7 +298,7 @@ function oppKnockdown(info) {
   ko.info = info;
   sfx.crowdCheer(1.5);
   arena.excitement = 2;
-  const base = { easy: 3, normal: 4, hard: 5 }[game.difficulty];
+  const base = { easy: 3, normal: 4, hard: 5, expert: 6, champion: 6 }[game.difficulty] ?? 4;
   game.getUpAt = opp.knockdowns >= 3 ? Infinity : Math.min(9, base + Math.floor(Math.random() * 3) + opp.knockdowns);
   banner('KNOCKDOWN!');
 }
@@ -321,6 +370,8 @@ function decision() {
 }
 
 function finish(won, method) {
+  if (game.phase === 'kocam') endKoCam();
+  finishCombo();
   game.phase = 'over';
   player.mode = player.mode === 'down' ? 'down' : 'idle';
   if (opp.mode !== 'down') opp.mode = 'idle';
@@ -337,13 +388,19 @@ function finish(won, method) {
     $('res-detail').textContent = `${won === null ? '' : won ? 'Won' : 'Lost'} by ${method.toLowerCase()} · round ${game.round}`;
     const acc = s.thrown ? Math.round((100 * s.landed) / s.thrown) : 0;
     const rows = [
-      ['Punches landed', `${s.landed} / ${s.thrown} (${acc}%)`],
+      ['Strikes landed', `${s.landed} / ${s.thrown} (${acc}%)`],
       ['Damage dealt / taken', `${s.dealt.toFixed(0)} / ${s.taken.toFixed(0)}`],
-      ['Hardest punch', `${s.topSpeed.toFixed(1)} m/s · ${s.topEnergy.toFixed(0)} J`],
-      ['Their punches blocked / dodged', `${s.blocked} / ${s.dodged}`],
+      ['Hardest strike', `${s.topSpeed.toFixed(1)} m/s · ${s.topEnergy.toFixed(0)} J`],
+      ['Their strikes blocked / dodged', `${s.blocked} / ${s.dodged}`],
       ['Knockdowns (scored / suffered)', `${opp.knockdowns || 0} / ${player.knockdowns}`],
+      ['Best combo', s.bestCombo ? `${s.bestCombo.hits} hits` : '—'],
     ];
-    $('res-stats').innerHTML = rows.map(([a, b]) => `<div>${a}</div><div>${b}</div>`).join('');
+    const box = $('res-stats');
+    box.textContent = '';
+    for (const [a, b] of rows) { const x = document.createElement('div'); x.textContent = a; const y = document.createElement('div'); y.textContent = b; box.append(x, y); }
+    const n = combo.clips.length;
+    $('highlights-btn').hidden = !n;
+    $('highlights-btn').textContent = `WATCH HIGHLIGHTS (${n})`;
     $('again').textContent = mp.on ? 'BACK TO LOBBY' : 'REMATCH';
     $('results').classList.remove('hidden');
     if (document.pointerLockElement) document.exitPointerLock();
@@ -366,31 +423,43 @@ function toMenu() {
   setGlovesVisible(false);
 }
 
-// ---------------------------------------------------------------- knockout cam
-// Every frame we record all particle positions. On a knockdown the last ~2 s are
-// replayed in slow motion from a third-person camera that orbits the impact.
-const KO_BEFORE = 0.8, KO_AFTER = 1.15;
-const REC_FRAMES = 480;
+// ---------------------------------------------------------------- replays: knockout cam & highlight reel
+// The last ~8 s of every particle is recorded (60 times a second). While you fight, your
+// actions are grouped into combos (strikes, dodges, blocks with less than 1.3 s between
+// them). Good combos are copied out as clips for the highlight reel. A knockdown replays
+// its whole combo: slow at each key moment (a duck, a slip, a block) and ultra slow on
+// the final blow.
+const KO_AFTER = 1.15;
+const REC_FRAMES = 480, REC_DT = 1 / 60;
 const NP = world.particles.length;
-const NX = 9;   // extra per-frame values (see extrasInto)
-const rec = { t: new Float64Array(REC_FRAMES), pos: new Float32Array(REC_FRAMES * NP * 3), extra: new Float32Array(REC_FRAMES * NX), head: 0, count: 0 };
+const NX = 11;   // extra per-frame values (see extrasInto)
+const COMBO_GAP = 1.3;
+const MAX_CLIPS = 8;
+const rec = { t: new Float64Array(REC_FRAMES), pos: new Float32Array(REC_FRAMES * NP * 3), extra: new Float32Array(REC_FRAMES * NX), head: 0, count: 0, lastT: -1 };
 const live = { pos: new Float32Array(NP * 3), prev: new Float32Array(NP * 3), extra: new Float32Array(NX) };
-const ko = { hitTime: 0, t: 0, info: null, skip: false, impactPlayed: false, center: new THREE.Vector3(), angle0: 0, shake: 0 };
+const ko = { hitTime: 0, info: null, skip: false };
+const reel = { clips: [], i: 0, t: 0, mode: null, clip: null, center: new THREE.Vector3(), angle0: 0, shake: 0, next: 0, chain: [], abort: false };
+const combo = { cur: null, clips: [] };
 const _look = new THREE.Vector3();
 const _bodyQ = { quaternion: new THREE.Quaternion() };
+const smooth01 = (x) => { x = Math.min(1, Math.max(0, x)); return x * x * (3 - 2 * x); };
 
 function extrasInto(arr, o) {
   arr[o] = player.pos.x; arr[o + 1] = player.pos.z; arr[o + 2] = player.yaw; arr[o + 3] = player.twist;
   arr[o + 4] = opp.yaw; arr[o + 5] = player.duck;
   arr[o + 6] = player.vel.x; arr[o + 7] = player.vel.z; arr[o + 8] = player.avatar.phase;
+  arr[o + 9] = player.leg.side; arr[o + 10] = player.jumpY;
 }
 function extrasFrom(arr, o) {
   player.pos.x = arr[o]; player.pos.z = arr[o + 1]; player.yaw = arr[o + 2]; player.twist = arr[o + 3];
   opp.yaw = arr[o + 4]; player.duck = arr[o + 5];
   player.vel.x = arr[o + 6]; player.vel.z = arr[o + 7]; player.avatar.phase = arr[o + 8];
+  player.leg.side = arr[o + 9]; player.jumpY = arr[o + 10];
 }
 
 function recordFrame() {
+  if (rec.count && game.time - rec.lastT < REC_DT) return;
+  rec.lastT = game.time;
   const i = rec.head;
   rec.t[i] = game.time;
   const base = i * NP * 3;
@@ -400,90 +469,171 @@ function recordFrame() {
   rec.count = Math.min(REC_FRAMES, rec.count + 1);
 }
 
-function sampleReplay(time) {
-  // frames are in chronological order starting at the oldest one
+/** Copy recorded frames between two times into a standalone clip. */
+function framesBetween(t0, t1) {
+  const out = [];
   const first = (rec.head - rec.count + REC_FRAMES) % REC_FRAMES;
-  let a = first, b = first;
   for (let n = 0; n < rec.count; n++) {
     const i = (first + n) % REC_FRAMES;
-    if (rec.t[i] <= time) a = i;
-    if (rec.t[i] >= time) { b = i; break; }
-    b = i;
+    if (rec.t[i] < t0 || rec.t[i] > t1) continue;
+    out.push({ t: rec.t[i], pos: rec.pos.slice(i * NP * 3, (i + 1) * NP * 3), extra: rec.extra.slice(i * NX, (i + 1) * NX) });
   }
-  const span = rec.t[b] - rec.t[a];
-  const u = span > 1e-6 ? THREE.MathUtils.clamp((time - rec.t[a]) / span, 0, 1) : 0;
-  const ba = a * NP * 3, bb = b * NP * 3;
-  world.particles.forEach((p, k) => {
-    const j = k * 3;
-    p.pos.set(
-      rec.pos[ba + j] + (rec.pos[bb + j] - rec.pos[ba + j]) * u,
-      rec.pos[ba + j + 1] + (rec.pos[bb + j + 1] - rec.pos[ba + j + 1]) * u,
-      rec.pos[ba + j + 2] + (rec.pos[bb + j + 2] - rec.pos[ba + j + 2]) * u,
-    );
-  });
-  extrasFrom(rec.extra, u < 0.5 ? a * NX : b * NX);
+  return out;
 }
 
-function startKoCam() {
+/** Your fight actions, grouped into combos. kind: hit | dodge | block | sweep */
+function logEvent(kind, label, extra = {}) {
+  if (game.phase === 'menu' || game.phase === 'over') return;
+  const t = game.time;
+  if (!combo.cur || t - combo.cur.last > COMBO_GAP) {
+    finishCombo();
+    combo.cur = { start: t, last: t, events: [], hits: 0, dmg: 0, defense: 0, sweeps: 0 };
+  }
+  const c = combo.cur;
+  c.events.push({ t, kind, label, ...extra });
+  c.last = t;
+  if (kind === 'hit') { c.hits++; c.dmg += extra.dmg || 0; }
+  if (kind === 'dodge' || kind === 'block') c.defense++;
+  if (kind === 'sweep') c.sweeps++;
+}
+
+const comboWorth = (c) => c.hits >= 3 || (c.defense >= 1 && c.hits >= 1) || c.sweeps > 0 || c.events.some((e) => /SUPERMAN/.test(e.label) && e.kind === 'hit');
+
+/** Close the current combo; save it as a clip if it was a good one (or ended in a knockdown). */
+function finishCombo(knockout = false) {
+  const c = combo.cur;
+  if (!c) return null;
+  combo.cur = null;
+  if (!knockout && !comboWorth(c)) return null;
+  // keep only defence that leads into the strikes (a lone early block isn't part of the story)
+  const firstHit = c.events.findIndex((e) => e.kind === 'hit');
+  const events = c.events.filter((e, i) => e.kind !== 'block' || (firstHit >= 0 && i >= firstHit - 2));
+  const t0 = Math.max(events[0].t - 0.6, (knockout ? ko.hitTime : c.last) - 7);
+  const frames = framesBetween(t0, knockout ? ko.hitTime + KO_AFTER : c.last + 0.9);
+  if (frames.length < 5) return null;
+  const markers = events.map((e) => ({ t: e.t, label: e.label, kind: e.kind, speed: e.speed, energy: e.energy, final: false }));
+  if (knockout) { const lastHit = [...markers].reverse().find((m) => m.kind === 'hit'); if (lastHit) lastHit.final = true; }
+  const title = markers.filter((m) => m.kind !== 'sweep').map((m) => m.label).join('  →  ');
+  const clip = { frames, markers, title, ko: knockout, hits: c.hits, t: c.start,
+    score: c.hits + c.defense * 1.5 + c.dmg / 10 + c.sweeps * 3 + (knockout ? 10 : 0) };
+  combo.clips.push(clip);
+  combo.clips.sort((a, b) => b.score - a.score);
+  combo.clips.length = Math.min(combo.clips.length, MAX_CLIPS);
+  if (c.hits > (game.stats.bestCombo?.hits || 0)) game.stats.bestCombo = { hits: c.hits, title };
+  return clip;
+}
+
+function sampleClip(clip, time) {
+  const f = clip.frames;
+  let lo = 0, hi = f.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (f[mid].t <= time) lo = mid; else hi = mid; }
+  const a = f[lo], b = f[hi];
+  const span = b.t - a.t;
+  const u = span > 1e-6 ? THREE.MathUtils.clamp((time - a.t) / span, 0, 1) : 0;
+  world.particles.forEach((p, k) => {
+    const j = k * 3;
+    p.pos.set(a.pos[j] + (b.pos[j] - a.pos[j]) * u, a.pos[j + 1] + (b.pos[j + 1] - a.pos[j + 1]) * u, a.pos[j + 2] + (b.pos[j + 2] - a.pos[j + 2]) * u);
+  });
+  extrasFrom(u < 0.5 ? a.extra : b.extra, 0);
+}
+
+/** Playback speed: slow at each key moment, ultra slow on the knockout blow. */
+function rateAt(clip, t) {
+  let r = clip.ko ? 0.6 : 0.75;
+  for (const m of clip.markers) {
+    const d = Math.abs(t - m.t);
+    if (m.final) r = Math.min(r, (mp.on ? 0.1 : 0.04) + 0.6 * smooth01(d / 0.5));
+    else r = Math.min(r, 0.22 + 0.5 * smooth01(d / 0.3));
+  }
+  return r * (mp.on && reel.mode === 'ko' ? 1.8 : 1);   // online the fight goes on, so keep it short
+}
+
+function playClips(clips, mode) {
+  if (!clips.length) return false;
   world.particles.forEach((p, k) => {
     live.pos[k * 3] = p.pos.x; live.pos[k * 3 + 1] = p.pos.y; live.pos[k * 3 + 2] = p.pos.z;
     live.prev[k * 3] = p.prev.x; live.prev[k * 3 + 1] = p.prev.y; live.prev[k * 3 + 2] = p.prev.z;
   });
   extrasInto(live.extra, 0);
-  game.phase = 'kocam';
-  ko.t = ko.hitTime - KO_BEFORE;
-  ko.skip = false; ko.impactPlayed = false; ko.shake = 0;
-  // frame the shot from the side of the line between the two fighters
-  sampleReplay(ko.hitTime);
-  const dx = opp.p.head.pos.x - player.pos.x, dz = opp.p.head.pos.z - player.pos.z;
-  ko.center.set(player.pos.x + dx * 0.55, 0, player.pos.z + dz * 0.55);
-  ko.angle0 = Math.atan2(dz, dx) + (Math.random() < 0.5 ? 1 : -1) * (Math.PI / 2 - 0.35);
+  live.legPunch = player.leg.punch; player.leg.punch = null;
+  Object.assign(reel, { clips, mode, abort: false });
+  ko.skip = false;
+  game.phase = mode === 'ko' ? 'kocam' : 'reel';
   player.avatar.group.visible = true;
   $('hud').classList.add('hidden');
   $('kocam').classList.remove('hidden');
-  const i = ko.info;
-  $('kc-caption').textContent = i ? `${i.name} · ${i.speed.toFixed(1)} m/s · ${i.energy.toFixed(0)} J` : '';
+  $('kc-title-text').textContent = mode === 'ko' ? 'KNOCKOUT CAM' : 'HIGHLIGHTS';
+  startClip(0);
+  return true;
+}
+
+function startClip(i) {
+  const c = reel.clips[i];
+  Object.assign(reel, { i, clip: c, t: c.frames[0].t, next: 0, chain: [], shake: 0 });
+  const key = (c.markers.find((m) => m.final) || c.markers[c.markers.length - 1] || c.frames[c.frames.length >> 1]).t;
+  sampleClip(c, key);
+  const dx = opp.p.head.pos.x - player.pos.x, dz = opp.p.head.pos.z - player.pos.z;
+  reel.center.set(player.pos.x + dx * 0.55, 0, player.pos.z + dz * 0.55);
+  reel.angle0 = Math.atan2(dz, dx) + (Math.random() < 0.5 ? 1 : -1) * (Math.PI / 2 - 0.35);
+  $('kc-sub').textContent = reel.mode === 'reel' ? `${i + 1} / ${reel.clips.length}${c.ko ? ' · KNOCKOUT' : ''}` : '';
+  $('kc-caption').textContent = '';
   $('kc-caption').classList.remove('show');
 }
 
-function updateKoCam(dtReal) {
-  const near = Math.abs(ko.t - ko.hitTime);
-  const rate = (0.12 + 0.33 * Math.min(1, near / 0.35)) * (mp.on ? 1.6 : 1);   // slowest right at the impact; quicker online
-  ko.t += dtReal * rate;
-  if (!ko.impactPlayed && ko.t >= ko.hitTime) {
-    ko.impactPlayed = true;
-    ko.shake = 1;
-    sfx.punch(1.4, 'head');
-    sfx.crowdCheer(1.5);
+function updateReel(dtReal) {
+  const c = reel.clip;
+  reel.t += dtReal * rateAt(c, reel.t);
+  while (reel.next < c.markers.length && reel.t >= c.markers[reel.next].t) {
+    const m = c.markers[reel.next++];
+    if (m.kind !== 'sweep') reel.chain.push(m.label);
+    if (m.kind === 'hit') { sfx.punch(m.final ? 1.4 : 0.9, 'head'); reel.shake = m.final ? 1 : 0.4; }
+    else if (m.kind === 'dodge') sfx.whoosh(0.8);
+    else if (m.kind === 'block') sfx.block(0.8);
+    else if (m.kind === 'sweep') { reel.chain.push('SWEEP'); sfx.crowdCheer(1); }
+    if (m.final) sfx.crowdCheer(1.5);
+    $('kc-caption').textContent = reel.chain.join('  →  ') + (m.final && m.speed ? `   ·   ${m.speed.toFixed(1)} m/s · ${m.energy.toFixed(0)} J` : '');
     $('kc-caption').classList.add('show');
   }
-  sampleReplay(ko.t);
-  const prog = (ko.t - (ko.hitTime - KO_BEFORE)) / (KO_BEFORE + KO_AFTER);
-  const ang = ko.angle0 + prog * 0.6;
-  ko.shake = Math.max(0, ko.shake - dtReal * 2.5);
-  const sh = ko.shake * 0.03;
-  camera.position.set(ko.center.x + Math.cos(ang) * 2.3 + (Math.random() - 0.5) * sh, 1.45 - prog * 0.35 + (Math.random() - 0.5) * sh, ko.center.z + Math.sin(ang) * 2.3);
-  _look.copy(opp.p.head.pos).lerp(ko.center.setY(1.2), 0.35);
+  sampleClip(c, reel.t);
+  const t0 = c.frames[0].t, t1 = c.frames[c.frames.length - 1].t;
+  const prog = (reel.t - t0) / Math.max(0.01, t1 - t0);
+  const ang = reel.angle0 + prog * 0.7;
+  reel.shake = Math.max(0, reel.shake - dtReal * 2.5);
+  const sh = reel.shake * 0.03;
+  camera.position.set(reel.center.x + Math.cos(ang) * 2.4 + (Math.random() - 0.5) * sh, 1.45 - prog * 0.35 + (Math.random() - 0.5) * sh, reel.center.z + Math.sin(ang) * 2.4);
+  _look.copy(opp.p.head.pos).lerp(reel.center.setY(1.2), 0.35);
   camera.lookAt(_look);
-  ko.center.y = 0;
+  reel.center.y = 0;
 
   _bodyQ.quaternion.setFromEuler(new THREE.Euler(0, player.yaw + player.twist, 0, 'YXZ'));
   opp.view.update();
   player.view.update(_bodyQ);
+  player.legView.update(_bodyQ);
   player.avatar.update();
-  arena.updateRopes();
   debugView.update();
-  if (ko.t >= ko.hitTime + KO_AFTER || ko.skip) endKoCam();
+  if (reel.abort) { endReel(); return; }
+  if (reel.t >= t1 || ko.skip) {
+    ko.skip = false;
+    if (reel.i + 1 < reel.clips.length) startClip(reel.i + 1); else endReel();
+  }
 }
 
-function endKoCam() {
+function endReel() {
   world.particles.forEach((p, k) => {
     p.pos.set(live.pos[k * 3], live.pos[k * 3 + 1], live.pos[k * 3 + 2]);
     p.prev.set(live.prev[k * 3], live.prev[k * 3 + 1], live.prev[k * 3 + 2]);
   });
   extrasFrom(live.extra, 0);
+  player.leg.punch = live.legPunch || null;
   player.avatar.group.visible = false;
   $('kocam').classList.add('hidden');
+  const mode = reel.mode;
+  reel.mode = null;
+  if (mode === 'reel') { game.phase = 'over'; $('results').classList.remove('hidden'); return; }
+  afterKnockoutReplay();
+}
+
+function afterKnockoutReplay() {
   $('hud').classList.remove('hidden');
   game.count = 0; game.countT = 0;
   if (mp.on) {
@@ -493,6 +643,21 @@ function endKoCam() {
   } else game.phase = 'knockdown';
 }
 
+// Knockout cam: replay the combo that ended in the knockdown.
+function startKoCam() {
+  const clip = finishCombo(true);
+  if (!clip || !playClips([clip], 'ko')) afterKnockoutReplay();
+}
+const updateKoCam = updateReel;
+const endKoCam = endReel;
+
+function watchHighlights() {
+  finishCombo();
+  const clips = [...combo.clips].sort((a, b) => a.t - b.t);   // in the order they happened
+  if (!clips.length) return;
+  $('results').classList.add('hidden');
+  playClips(clips, 'reel');
+}
 
 // ---------------------------------------------------------------- online play
 // The host runs the match clock (rounds, knockdown counts, result). Each fighter
@@ -501,10 +666,11 @@ function endKoCam() {
 const net = new Net();
 const MP_DIFF = { damage: 0.9, power: 1 };
 const PH = ['none', 'wind', 'ext', 'ret'];
-const TYPES = ['straight', 'hook', 'uppercut', 'bodyhook'];
-const TYPE_POWER = { straight: 1, hook: 1.15, uppercut: 1.15, bodyhook: 1.1 };
-const MODES = ['fight', 'idle', 'down', 'rising'];
-const remoteBody = { pos: new THREE.Vector3(), vel: new THREE.Vector3(), head: new THREE.Vector3(0, 1.6, 0), gloves: [new THREE.Vector3(), new THREE.Vector3()], yaw: 0 };
+const TYPES = ['straight', 'hook', 'uppercut', 'bodyhook', 'superman'];
+const TYPE_POWER = { straight: 1, hook: 1.15, uppercut: 1.15, bodyhook: 1.1, superman: 1.6, kick: 1.3 };
+const MODES = ['fight', 'idle', 'down', 'rising', 'tripped'];
+const remoteBody = { pos: new THREE.Vector3(), vel: new THREE.Vector3(), head: new THREE.Vector3(0, 1.6, 0), gloves: [new THREE.Vector3(), new THREE.Vector3()], yaw: 0,
+  kickPos: new THREE.Vector3(), jumpY: 0 };
 const mp = { on: false };
 const _gv = new THREE.Vector3();
 const num = (v, lo, hi, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d);
@@ -529,10 +695,13 @@ function myState() {
     const pu = g.punch;
     k.push(pu ? PH.indexOf(pu.phase) : 0, pu ? TYPES.indexOf(pu.type) : 0, pu ? pu.seq : 0, r3(g.particle.getVelocity(STEP, _gv).length()));
   }
+  const kp = player.leg.punch;   // the kick: phase, which leg, sequence, foot speed
+  k.push(kp ? PH.indexOf(kp.phase) : 0, player.leg.side, kp ? kp.seq : 0, r3(player.leg.particle.getVelocity(STEP, _gv).length()));
   const s = [player.pos.x, player.pos.z, player.vel.x, player.vel.z, player.yaw + player.twist,
     player.headPos.x, player.headPos.y, player.headPos.z,
-    ...player.gloves[0].particle.pos.toArray(), ...player.gloves[1].particle.pos.toArray()].map(r3);
-  const st = { role: mp.role, name: net.name, s, k, mode: player.mode, hp: r3(player.health), kd: player.knockdowns,
+    ...player.gloves[0].particle.pos.toArray(), ...player.gloves[1].particle.pos.toArray(),
+    ...player.leg.particle.pos.toArray(), player.jumpY].map(r3);
+  const st = { role: mp.role, name: net.name, s, k, mode: player.mode, hp: r3(player.health), kd: player.knockdowns, c: r3(player.cons),
     taken: r3(game.stats.taken), ctr: game.time < game.counterUntil ? 1 : 0 };
   if (mp.hitLog.length) st.hit = mp.hitLog;
   if (mp.role === 'host') { st.m = mp.m; st.opp = mp.peer; }
@@ -542,7 +711,7 @@ function myState() {
 function readRemote(p) {
   const pr = p.presence || {};
   const s = pr.s, k = pr.k;
-  if (!Array.isArray(s) || s.length !== 14 || !Array.isArray(k) || k.length !== 8) return false;
+  if (!Array.isArray(s) || s.length !== 18 || !Array.isArray(k) || k.length !== 12) return false;
   const r = remoteBody;
   r.pos.set(num(s[0], -3.2, 3.2), 0, num(s[1], -3.2, 3.2));
   r.vel.set(num(s[2], -5, 5), 0, num(s[3], -5, 5));
@@ -551,9 +720,11 @@ function readRemote(p) {
   r.gloves[0].set(num(s[8], -3.5, 3.5), num(s[9], 0, 2.4, 1.3), num(s[10], -3.5, 3.5));
   r.gloves[1].set(num(s[11], -3.5, 3.5), num(s[12], 0, 2.4, 1.3), num(s[13], -3.5, 3.5));
   for (const g of r.gloves) if (g.distanceTo(r.head) > 1.1) g.sub(r.head).setLength(1.1).add(r.head);   // no impossible reach
+  r.kickPos.set(num(s[14], -3.5, 3.5), num(s[15], 0, 2.2, 0.1), num(s[16], -3.5, 3.5));
+  r.jumpY = num(s[17], 0, 1);
   mp.rs = {
     mode: MODES.includes(pr.mode) ? pr.mode : 'idle', hp: num(pr.hp, 0, 100, 100), kd: num(pr.kd, 0, 9) | 0,
-    taken: num(pr.taken, 0, 1e5), ctr: pr.ctr === 1, name: cleanName(pr.name),
+    taken: num(pr.taken, 0, 1e5), ctr: pr.ctr === 1, name: cleanName(pr.name), cons: num(pr.c, 0, 100, 100),
     hit: Array.isArray(pr.hit) ? pr.hit : null, m: pr.m && typeof pr.m === 'object' ? pr.m : null,
     opp: typeof pr.opp === 'string' ? pr.opp : null,
   };
@@ -562,13 +733,13 @@ function readRemote(p) {
 }
 
 const AI_NAME = (type, i) => (type === 'straight' ? (i === 0 ? 'jab' : 'cross') : type === 'hook' ? (i === 0 ? 'hookL' : 'hookR')
-  : type === 'uppercut' ? 'upperR' : 'bodyR');
+  : type === 'uppercut' ? 'upperR' : type === 'superman' ? 'superman' : 'bodyR');
 
 /** Copy their punches onto the puppet's hands so blocking, dodging, the warning ring and glow all work. */
 function mirrorPunches(k) {
   for (let i = 0; i < 2; i++) {
     const hand = i === 0 ? opp.hands.L : opp.hands.R;
-    const ph = PH[num(k[i * 4], 0, 3) | 0], type = TYPES[num(k[i * 4 + 1], 0, 3) | 0];
+    const ph = PH[num(k[i * 4], 0, 3) | 0], type = TYPES[num(k[i * 4 + 1], 0, TYPES.length - 1) | 0];
     const seq = num(k[i * 4 + 2], 0, 1e9) | 0, spd = num(k[i * 4 + 3], 0, 30);
     let pu = hand.punch;
     if (pu && (ph === 'none' || pu.seq !== seq)) { endMirror(pu); hand.punch = pu = null; }
@@ -581,6 +752,20 @@ function mirrorPunches(k) {
     if (ph === 'ext') { pu.sawExt = true; pu.speed = Math.max(pu.speed, spd); }
     pu.phase = ph;
   }
+  // their kick drives the puppet's matching foot (their left leg is this body's left foot)
+  const ph = PH[num(k[8], 0, 3) | 0], side = num(k[9], -1, 1) < 0 ? -1 : 1;
+  const seq = num(k[10], 0, 1e9) | 0, spd = num(k[11], 0, 30);
+  let kp = opp.kickSlot.punch;
+  if (kp && (ph === 'none' || kp.seq !== seq)) { endMirror(kp); opp.kickSlot.punch = kp = null; }
+  if (ph !== 'none') {
+    if (!kp) {
+      kp = opp.kickSlot.punch = { mirror: true, seq, type: 'kick', name: side < 0 ? 'kickL' : 'kickR', foot: side < 0 ? 'footL' : 'footR',
+        t: 0, wind: 1, phase: ph, hit: false, blocked: false, speed: 0, def: { power: TYPE_POWER.kick, kind: 'kick', aim: 'legs', ext: 0.2 } };
+    }
+    if (kp.phase === 'ext' && ph !== 'ext') endMirror(kp);
+    if (ph === 'ext') { kp.sawExt = true; kp.speed = Math.max(kp.speed, spd); }
+    kp.phase = ph;
+  }
 }
 
 /** Their punch finished without touching you: reward the dodge. */
@@ -588,19 +773,21 @@ function endMirror(pu) {
   if (pu.ended) return;
   pu.ended = true;
   if (!pu.sawExt || pu.hit || pu.blocked || player.mode !== 'fight' || game.phase !== 'fight') return;
-  if (!player.dodging && player.duck < 0.15) return;
+  if (!player.dodging && player.duck < 0.15 && !player.airborne) return;
   game.counterUntil = game.time + 0.7;
   game.stats.dodged++;
   player.stamina = Math.min(100, player.stamina + 6);
-  showImpact(player.dodging ? 'SLIPPED!' : 'DUCKED!', 'counter now');
+  const how = player.dodging ? 'SLIP' : player.airborne ? 'JUMP' : 'DUCK';
+  showImpact(`${how === 'SLIP' ? 'SLIPPED' : how === 'JUMP' ? 'JUMPED' : 'DUCKED'}!`, 'counter now');
+  logEvent('dodge', how);
 }
 
-/** You were hit (or blocked): tell the puncher. region 0 head, 1 body, 2 blocked. */
-function publishHit(pu, dmg, region, speed, energy, counter) {
+/** You were hit (or blocked): tell the puncher. region 0 head, 1 body, 2 blocked, 3 legs; swept: it knocked you off your feet. */
+function publishHit(pu, dmg, region, speed, energy, counter, swept = false) {
   if (!mp.on) return;
   mp.hitSeq++;
   // keep the last few, so two hits between network updates both get reported
-  mp.hitLog = [...mp.hitLog, [mp.hitSeq, pu.seq, r3(dmg), region, r3(speed), r3(energy), counter ? 1 : 0]].slice(-4);
+  mp.hitLog = [...mp.hitLog, [mp.hitSeq, pu.seq, r3(dmg), region, r3(speed), r3(energy), counter ? 1 : 0, swept ? 1 : 0]].slice(-4);
 }
 
 const hitSeqOf = (h) => (Array.isArray(h) ? num(h[0], 0, 1e9) | 0 : 0);
@@ -616,26 +803,31 @@ function readConfirm(h) {
   const seq = hitSeqOf(h);
   if (seq <= mp.lastConfirm) return;
   mp.lastConfirm = seq;
-  const punchSeq = num(h[1], 0, 1e9) | 0, dmg = num(h[2], 0, 100), region = num(h[3], 0, 2) | 0;
-  const speed = num(h[4], 0, 30), energy = num(h[5], 0, 2000), counter = h[6] === 1;
+  const punchSeq = num(h[1], 0, 1e9) | 0, dmg = num(h[2], 0, 100), region = num(h[3], 0, 3) | 0;
+  const speed = num(h[4], 0, 30), energy = num(h[5], 0, 2000), counter = h[6] === 1, swept = h[7] === 1;
   if (region === 2) { showImpact('BLOCKED', speed, energy); return; }
+  const name = mp.names.get(punchSeq) || 'STRIKE';
   game.stats.landed++;
   game.stats.dealt += dmg;
   game.stats.topSpeed = Math.max(game.stats.topSpeed, speed);
   game.stats.topEnergy = Math.max(game.stats.topEnergy, energy);
   arena.excitement += dmg / 20;
-  showImpact(counter ? 'COUNTER!' : region === 0 ? (dmg > 14 ? 'HUGE SHOT' : 'HEAD') : 'BODY SHOT', speed, energy);
-  mp.lastInfo = { name: mp.names.get(punchSeq) || 'PUNCH', speed, energy };
+  showImpact(swept ? 'SWEPT!' : counter ? 'COUNTER!' : region === 3 ? 'LEG KICK' : region === 0 ? (dmg > 14 ? 'HUGE SHOT' : 'HEAD') : 'BODY SHOT', speed, energy);
+  mp.lastInfo = { name, speed, energy };
+  logEvent('hit', (counter ? 'COUNTER ' : '') + name, { dmg, speed, energy });
+  if (swept) logEvent('sweep', 'SWEEP');
 }
 
 function syncRemoteMode() {
   const rm = mp.rs.mode;
   if (rm === 'down' && opp.mode !== 'down') { opp.knockDown(); onRemoteKnockdown(); }
-  else if ((rm === 'rising' || rm === 'fight') && opp.mode === 'down') opp.rise(mp.rs.hp);
+  else if (rm === 'tripped' && opp.mode === 'fight') opp.trip();
+  else if ((rm === 'rising' || rm === 'fight') && (opp.mode === 'down' || opp.mode === 'tripped')) opp.rise(mp.rs.hp, opp.mode === 'tripped');
   else if (rm === 'idle' && opp.mode === 'fight') opp.mode = 'idle';
   else if (rm === 'fight' && opp.mode === 'idle') opp.mode = 'fight';
   opp.health = mp.rs.hp;
   opp.knockdowns = mp.rs.kd;
+  opp.cons = mp.rs.cons;
 }
 
 function onRemoteKnockdown() {
@@ -758,6 +950,7 @@ function beginOnlineMatch() {
   game.stats = newStats();
   game.lagP = game.lagO = 100;
   game.counterUntil = -1;
+  combo.cur = null; combo.clips = [];
   opp.remote = remoteBody;
   opp.diff = MP_DIFF;
   mp.lastConfirm = Math.max(0, ...(mp.rs?.hit || []).map(hitSeqOf));   // ignore reports from before this match
@@ -948,21 +1141,23 @@ async function mpLeave(toLobby = false) {
 }
 
 // ---------------------------------------------------------------- incoming punch warning
-const THREAT_DIR = { jab: 't', cross: 't', hookL: 'r', hookR: 'l', bodyR: 'b', upperR: 'b' };
+const THREAT_DIR = { jab: 't', cross: 't', hookL: 'r', hookR: 'l', bodyR: 'b', upperR: 'b', superman: 't', kickL: 'b', kickR: 'b', kickBody: 'b' };
 const GET_UP_TEXT = TOUCH ? 'TAP ANY BUTTON TO GET UP' : 'MASH SPACE TO GET UP';
 const THREAT_HINT = TOUCH ? {
   jab: 'SLIP  ◀ ▶', cross: 'SLIP  ◀ ▶', hookL: 'DUCK', hookR: 'DUCK', bodyR: 'GUARD', upperR: 'SLIP  ◀ ▶',
+  superman: 'SLIP  ◀ ▶', kickL: 'JUMP', kickR: 'JUMP', kickBody: 'GUARD',
 } : {
-  jab: 'SLIP  ⇧ + CLICK', cross: 'SLIP  ⇧ + CLICK', hookL: 'DUCK  C', hookR: 'DUCK  C',
-  bodyR: 'BLOCK  SPACE', upperR: 'SLIP  ⇧ + CLICK',
+  jab: 'SLIP  ALT + A / D', cross: 'SLIP  ALT + A / D', hookL: 'DUCK  C', hookR: 'DUCK  C',
+  bodyR: 'BLOCK  SHIFT', upperR: 'SLIP  ALT + A / D',
+  superman: 'SLIP  ALT + A / D', kickL: 'JUMP  SPACE', kickR: 'JUMP  SPACE', kickBody: 'BLOCK  SHIFT',
 };
 const threatEls = { t: null, l: null, r: null, b: null };
 function updateThreat() {
   let hand = null;
   if (game.phase === 'fight' && opp.mode === 'fight' && player.mode === 'fight') {
-    for (const h of opp.handList) {
+    for (const h of [...opp.handList, opp.kickSlot]) {
       const pu = h.punch;
-      if (pu && !pu.hit && !pu.blocked && (pu.phase === 'wind' || pu.phase === 'ext')) hand = h;
+      if (pu && !pu.hit && !pu.blocked && !pu.feintShown && (pu.phase === 'wind' || pu.phase === 'ext')) hand = h;
     }
   }
   const box = $('threat');
@@ -1004,6 +1199,13 @@ function updateHud(dt) {
   $('o-health').style.width = `${opp.health}%`;
   $('o-lag').style.width = `${game.lagO}%`;
   $('stamina').style.width = `${player.stamina}%`;
+  $('p-cons').style.width = `${player.cons}%`;
+  $('o-cons').style.width = `${opp.cons ?? 100}%`;
+  $('p-cons').classList.toggle('low', player.cons < 35);
+  // dazed: your vision blurs and dims
+  const inst = player.mode === 'fight' || player.mode === 'idle' ? player.instability : 0;
+  const filter = inst > 0.03 ? `blur(${(inst * 2.2).toFixed(1)}px) saturate(${(1 - inst * 0.6).toFixed(2)}) brightness(${(1 - inst * 0.25).toFixed(2)})` : '';
+  if (filter !== game.filter) { game.filter = filter; canvas.style.filter = filter; }
   $('p-kd').textContent = player.knockdowns ? '▼ '.repeat(player.knockdowns) + 'KNOCKDOWNS' : '';
   $('o-kd').textContent = opp.knockdowns ? 'KNOCKDOWNS ' + '▼ '.repeat(opp.knockdowns) : '';
   const t = Math.max(0, Math.ceil(game.timer));
@@ -1074,24 +1276,27 @@ document.addEventListener('mousemove', (e) => {
 
 canvas.addEventListener('mousedown', (e) => {
   if (!inMatch() || game.paused || game.overlay) return;
-  if (game.phase === 'kocam') { ko.skip = true; return; }
+  if (game.phase === 'kocam' || game.phase === 'reel') { ko.skip = true; return; }
   if (!document.pointerLockElement && !game.noLock) { lockPointer(); return; }
-  if (e.shiftKey) {   // Shift + left/right click: slip your head that way
-    if (e.button === 0) player.requestDodge('left');
-    if (e.button === 2) player.requestDodge('right');
-    return;
-  }
+  // (in the air, a straight becomes a superman punch)
   if (e.button === 0) player.requestPunch(0, 'straight');
   if (e.button === 2) player.requestPunch(1, 'straight');
 });
 window.addEventListener('contextmenu', (e) => e.preventDefault());
 
+const DASH_KEYS = { KeyW: 'forward', KeyS: 'back', KeyA: 'left', KeyD: 'right' };
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+  if (e.code === 'Space' || e.code.startsWith('Arrow') || e.altKey || e.key === 'Alt') e.preventDefault();   // Alt: no browser menu
   if (e.code === 'KeyV') debugView.toggle();
   if (e.code === 'KeyM') sfx.toggleMute();
+  if (game.phase === 'reel') {   // highlight reel: any key skips, Esc stops
+    if (e.code === 'Escape') reel.abort = true; else if (e.code === 'Space' || e.code === 'Enter') ko.skip = true;
+    return;
+  }
   if (!inMatch() || game.paused || game.overlay) return;
   if (e.repeat) return;
+  // Alt + direction: slip / dash (doesn't also walk)
+  if (e.altKey && DASH_KEYS[e.code]) { player.requestDash(DASH_KEYS[e.code]); return; }
   player.keys.add(e.code);
   if (e.code === 'KeyP') { setPaused(true); return; }
   if (game.phase === 'kocam') {
@@ -1100,13 +1305,16 @@ window.addEventListener('keydown', (e) => {
   }
   if (e.code === 'KeyQ') player.requestPunch(0, e.shiftKey ? 'bodyhook' : 'hook');
   if (e.code === 'KeyE') player.requestPunch(1, e.shiftKey ? 'bodyhook' : 'hook');
-  if (e.code === 'KeyZ') player.requestPunch(0, 'uppercut');
-  if (e.code === 'KeyX') player.requestPunch(1, 'uppercut');
-  if (e.code === 'Space' && player.mode === 'down' && player.knockdowns < 3) {
-    player.recover += 0.085;
+  // Z / X: uppercuts; with Shift: left / right kick
+  if (e.code === 'KeyZ') { if (e.shiftKey) player.requestKick(-1); else player.requestPunch(0, 'uppercut'); }
+  if (e.code === 'KeyX') { if (e.shiftKey) player.requestKick(1); else player.requestPunch(1, 'uppercut'); }
+  if (e.code === 'KeyC' && player.mode === 'fight' && !mp.on) opp.noteHabit('duck');
+  if (e.code === 'Space') {
+    if (player.mode === 'down') { if (player.knockdowns < 3) player.recover += 0.085; }
+    else player.requestJump();
   }
 });
-window.addEventListener('keyup', (e) => player.keys.delete(e.code));
+window.addEventListener('keyup', (e) => { player.keys.delete(e.code); if (e.key === 'Alt') e.preventDefault(); });
 window.addEventListener('blur', () => player.keys.clear());
 
 document.querySelectorAll('[data-diff]').forEach((b) => b.addEventListener('click', () => {
@@ -1123,27 +1331,39 @@ $('join-btn').addEventListener('click', () => joinMatch($('code-input').value));
 $('code-input').addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') joinMatch($('code-input').value); });
 $('nick').addEventListener('keydown', (e) => e.stopPropagation());
 $('cancel-host').addEventListener('click', () => mpLeave(true));
+$('highlights-btn').addEventListener('click', watchHighlights);
 
 player.onPunch = (g, type) => {
   game.stats.thrown++;
   if (mp.on) mp.names.set(g.punch.seq, punchName(g, type));
-  else opp.notifyIncoming(game.time, type === 'bodyhook');
+  else opp.notifyIncoming(game.time, type === 'bodyhook' || type === 'kick', type === 'superman');
 };
-player.onSwing = () => sfx.whoosh(0.5);
+player.onSwing = (g) => sfx.whoosh(g.punch?.type === 'superman' || g.isLeg ? 0.9 : 0.5);
+player.onMiss = () => { if (!mp.on && game.phase === 'fight') opp.onOpening(game.time); };   // he punishes misses
+player.onJump = () => {
+  sfx.whoosh(0.3);
+  // a jump is the superman punch's tell: he sees it coming
+  if (!mp.on) { opp.notifyIncoming(game.time, false, true); opp.noteHabit('jump'); }
+};
+player.onDash = () => sfx.whoosh(0.4);
+player.onTrip = () => { sfx.punch(0.6, 'body'); arena.excitement += 1; };
+opp.onTrip = () => { arena.excitement += 1.2; };
 opp.onSwing = () => { sfx.whoosh(0.3); game.stats.oppThrown++; };
-player.onDodge = () => sfx.whoosh(0.45);
-// A punch that misses while you were moving your head leaves him open for a counter.
+player.onDodge = () => { sfx.whoosh(0.45); if (!mp.on) opp.noteHabit('slip'); };
+// A strike that misses while you were moving your head (or jumping its kick) leaves him open for a counter.
 opp.onWhiff = (o, hand) => {
   if (game.phase !== 'fight' || player.mode !== 'fight') return;
   const ducked = player.duck > 0.15;
-  if (!player.dodging && !ducked) return;
+  if (!player.dodging && !ducked && !player.airborne) return;
   hand.punch.whiffed = true;
   o.staggerT = Math.max(o.staggerT, 0.35);
   o.comboQueue = [];
   game.counterUntil = game.time + 0.7;
   game.stats.dodged++;
   player.stamina = Math.min(100, player.stamina + 6);
-  showImpact(player.dodging ? 'SLIPPED!' : 'DUCKED!', 'counter now');
+  const how = player.dodging ? 'SLIP' : player.airborne ? 'JUMP' : 'DUCK';
+  showImpact(`${how === 'SLIP' ? 'SLIPPED' : how === 'JUMP' ? 'JUMPED' : 'DUCKED'}!`, 'counter now');
+  logEvent('dodge', how);
 };
 
 window.addEventListener('resize', () => {
@@ -1165,7 +1385,7 @@ const touch = TOUCH ? new TouchControls({
   onPause: () => { if (inMatch()) setPaused(true); },
 }) : null;
 // tap to skip the knockout replay
-document.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'mouse' && game.phase === 'kocam') ko.skip = true; });
+document.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'mouse' && (game.phase === 'kocam' || game.phase === 'reel')) ko.skip = true; });
 
 // ---------------------------------------------------------------- loop
 function updatePhase(dt, dtReal) {
@@ -1217,7 +1437,8 @@ renderer.setAnimationLoop((now) => {
   last = now;
   if (game.paused && !mp.on) { touch?.setVisible(false); renderer.render(scene, camera); return; }
   if (mp.on) mpUpdate(dtReal, dtReal, now);
-  if (game.phase === 'kocam') {
+  if (game.phase === 'kocam' || game.phase === 'reel') {
+    if (game.filter) { game.filter = ''; canvas.style.filter = ''; }
     updateKoCam(dtReal);
     arena.updateCrowd(dtReal);
     renderer.render(scene, camera);
@@ -1240,7 +1461,8 @@ renderer.setAnimationLoop((now) => {
 
   player.avatar.tick(dt);
   if (game.phase !== 'menu') recordFrame();
-  arena.updateRopes();
+  // a combo ends when you've done nothing for a moment
+  if (combo.cur && game.phase !== 'kowait' && game.time - combo.cur.last > COMBO_GAP) finishCombo();
   arena.updateCrowd(dtReal);
   opp.view.update();
   debugView.update();
@@ -1253,12 +1475,13 @@ renderer.setAnimationLoop((now) => {
     player.updateCamera(camera);
     camera.updateMatrixWorld();
     player.view.update(camera);
+    player.legView.update(camera);
     updateHud(dtReal);
     updateThreat();
   }
-  touch?.setVisible(inMatch() && !game.paused && !game.overlay && game.phase !== 'kocam');
+  touch?.setVisible(inMatch() && !game.paused && !game.overlay && game.phase !== 'kocam' && game.phase !== 'reel');
   renderer.render(scene, camera);
 });
 
 // handy for tinkering from the console
-window.game = { game, player, opp, world, arena, startMatch, oppKnockdown, mp, net };
+window.game = { game, player, opp, world, arena, startMatch, oppKnockdown, mp, net, combo, reel, rateAt, watchHighlights, finishCombo, recordFrame, startKoCam, updateReel, finish };
