@@ -17,7 +17,7 @@
 
 export const NET_CONFIG = {
   /** URL that returns a JSON array of ICE servers (Metered's format). */
-  turnCredentialsUrl: '',
+  turnCredentialsUrl: 'https://knockoutphysics.metered.live/api/v1/turn/credentials?apiKey=00e5ab637edde6914f61b5035351a6b51075',
   /** Relay servers listed directly instead, e.g. your own coturn: [{ urls, username, credential }]. */
   iceServers: [],
 };
