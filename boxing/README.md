@@ -3,7 +3,8 @@
 A first-person MMA game in an octagon where the fighting is driven by physics, not canned animations. (No wrestling, for now: it's all striking.)
 
 - **Your gloves** are 3 kg simulated bodies pulled toward punch targets by spring-damper (PD) "muscles", with arm length enforced by a distance constraint. Damage comes from the **actual impact speed** of the collision, so range, timing, footwork (stepping in adds speed) and stamina (tired = weaker muscles) all matter.
-- **The opponent** is an *active ragdoll*: 17 Verlet particles joined by 36 constraints, held upright by muscle springs toward an animated pose. Hits physically snap his head back. Head shots daze him (muscle tone drops, he wobbles), and at 0 health his tone goes to zero and he collapses under gravity, then has to push himself back up.
+- **The opponent** is an *active ragdoll*: 17 Verlet particles with joint limits and self-collision. Nothing anchors him in place: muscles only shape his pose (they can't push the body as a whole), his legs push against the floor (as hard as grip allows) to move him, and his weight is only held up while he's balanced over his feet. When a hit or shove moves his balance point (the capture point) past his feet he takes real recovery steps, stumbling several if he has to, and falls if no step can catch him. Struck areas go briefly slack, so heads snap and bodies fold before recovering. Heavy hits freeze the moment for a few hundredths of a second (hit-stop).
+- **One continuous body.** Each fighter is a single smooth skinned mesh, modelled at load from blended shapes (torso, chest, glutes, tapered and muscled limbs, a head with jaw, nose and ears) and bent by a 17-bone skeleton that follows the physics. Your first-person arms are skinned the same way.
 - **Blocking is physical.** Your gloves and his gloves are colliders, so a guard only works if the gloves are actually in the way.
 - **The ropes** are Verlet chains that he bounces off.
 - **Telegraphed attacks.** The glove he's about to throw glows, and a ring around your sights lights up on the side it's coming from, with a hint for how to avoid it. Slip or duck it and he's left open for a counter.
@@ -86,7 +87,8 @@ On the claude.ai page the game uses the artifact `room` capability instead, whic
 | File | What it does |
 |---|---|
 | `src/physics.js` | Verlet engine: particles, distance constraints (equal / max / min), floor friction, sphere and segment contacts with impulses, two-bone IK |
-| `src/fighter.js` | Opponent ragdoll, muscle controller, AI (stalk / combo / retreat, blocking and slipping), visuals |
+| `src/fighter.js` | Opponent active ragdoll (balance, stepping, muscles), AI, visuals |
+| `src/body.js` | Builds the skinned human body (distance field + surface nets + skinning) |
 | `src/player.js` | First-person controller, PD-driven gloves, punch trajectories, head-recoil springs |
 | `src/arena.js` | Octagon cage, lights, crowd |
 | `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, rounds / knockdowns, knockout cam, online match flow, HUD, input |

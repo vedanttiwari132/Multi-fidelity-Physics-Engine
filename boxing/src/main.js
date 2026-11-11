@@ -190,6 +190,7 @@ function onGloveContact(g, p, speed) {
   game.stats.topSpeed = Math.max(game.stats.topSpeed, speed);
   game.stats.topEnergy = Math.max(game.stats.topEnergy, energy);
   opp.takeHit(dmg, p.region, { cons, bal });
+  if (dmg > 6) game.hitStop = Math.min(0.08, dmg * 0.004);   // a heavy shot freezes the moment
   sfx.punch(Math.min(1.5, speed / 9 * (isKick ? 1.3 : 1)), p.region === 'low' ? 'body' : p.region);
   arena.excitement += dmg / 20;
   const name = punchName(g, pu.type);
@@ -225,6 +226,7 @@ function onPlayerStruck(hand, speed, imp, region) {
     sfx.punch(speed / 9, region === 'legs' ? 'body' : region);
     game.vignette = Math.min(1, game.vignette + dmg / 16);
     arena.excitement += dmg / 25;
+    if (dmg > 6) game.hitStop = Math.min(0.08, dmg * 0.004);
     if (player.mode === 'tripped') { banner('SWEPT!'); sfx.crowdCheer(0.8); }
   }
   player.takeHit(imp, dmg, region === 'legs' ? 'body' : region);
@@ -560,6 +562,7 @@ function playClips(clips, mode) {
   ko.skip = false;
   game.phase = mode === 'ko' ? 'kocam' : 'reel';
   player.avatar.group.visible = true;
+  for (const it of player.view.items) it.arm.visible = false;   // the avatar has its own arms
   $('hud').classList.add('hidden');
   $('kocam').classList.remove('hidden');
   $('kc-title-text').textContent = mode === 'ko' ? 'KNOCKOUT CAM' : 'HIGHLIGHTS';
@@ -626,6 +629,7 @@ function endReel() {
   extrasFrom(live.extra, 0);
   player.leg.punch = live.legPunch || null;
   player.avatar.group.visible = false;
+  for (const it of player.view.items) it.arm.visible = it.group.visible;
   $('kocam').classList.add('hidden');
   const mode = reel.mode;
   reel.mode = null;
@@ -1222,7 +1226,7 @@ function updateHud(dt) {
 }
 
 function setGlovesVisible(v) {
-  for (const it of player.view.items) it.group.visible = it.fore.visible = it.upper.visible = v;
+  for (const it of player.view.items) it.group.visible = it.arm.visible = v;
 }
 
 // ---------------------------------------------------------------- input
@@ -1445,8 +1449,9 @@ renderer.setAnimationLoop((now) => {
     return;
   }
 
-  if (game.slowmo > 0) { game.slowmo -= dtReal; game.timeScale = 0.25; }
-  else game.timeScale = Math.min(1, game.timeScale + dtReal * 2);
+  if (game.hitStop > 0) { game.hitStop -= dtReal; game.timeScale = 0.05; }
+  else if (game.slowmo > 0) { game.slowmo -= dtReal; game.timeScale = 0.25; }
+  else game.timeScale = Math.min(1, game.timeScale + dtReal * (game.timeScale < 0.2 ? 12 : 2));
   const dt = dtReal * game.timeScale;
   game.time += dt;
   ctx.time = game.time;
@@ -1469,7 +1474,7 @@ renderer.setAnimationLoop((now) => {
 
   if (game.phase === 'menu') {
     const a = game.time * 0.12;
-    camera.position.set(Math.sin(a) * 4.2, 2.0, Math.cos(a) * 4.2);
+    camera.position.set(Math.sin(a) * 2.9, 1.75, Math.cos(a) * 2.9);   // inside the cage
     camera.lookAt(opp.p.chest.pos.x, 1.2, opp.p.chest.pos.z);
   } else {
     player.updateCamera(camera);
@@ -1484,4 +1489,4 @@ renderer.setAnimationLoop((now) => {
 });
 
 // handy for tinkering from the console
-window.game = { game, player, opp, world, arena, startMatch, oppKnockdown, mp, net, combo, reel, rateAt, watchHighlights, finishCombo, recordFrame, startKoCam, updateReel, finish };
+window.game = { camera, game, player, opp, world, arena, startMatch, oppKnockdown, mp, net, combo, reel, rateAt, watchHighlights, finishCombo, recordFrame, startKoCam, updateReel, finish };

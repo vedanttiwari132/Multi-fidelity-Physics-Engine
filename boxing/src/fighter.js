@@ -9,6 +9,7 @@
 import * as THREE from 'three';
 import { Particle, DistanceConstraint, HingeConstraint, solveTwoBone } from './physics.js';
 import { clampToOctagon, OCT_APOTHEM } from './arena.js';
+import { buildHumanTemplate, SkinnedBody } from './body.js';
 
 export const UPPER_ARM = 0.31, FOREARM = 0.34, THIGH = 0.41, SHIN = 0.44;
 const G = 9.81;
@@ -110,6 +111,12 @@ const READS = {
   jump: [['kickBody'], ['jab', 'cross']],
 };
 const pick = (list) => list[Math.floor(Math.random() * list.length)];
+function distToSegment(p, a, b) {
+  const abx = b.x - a.x, abz = b.z - a.z;
+  const l2 = abx * abx + abz * abz;
+  const t = l2 > 1e-9 ? Math.min(1, Math.max(0, ((p.x - a.x) * abx + (p.z - a.z) * abz) / l2)) : 0;
+  return Math.hypot(p.x - a.x - abx * t, p.z - a.z - abz * t);
+}
 const COMBOS = [
   ['jab'], ['jab', 'cross'], ['jab', 'jab', 'cross'], ['cross', 'hookL'], ['jab', 'cross', 'hookL'],
   ['bodyR', 'hookL'], ['hookR'], ['upperR', 'hookL'], ['jab', 'bodyR'], ['jab', 'upperR'],
@@ -182,6 +189,11 @@ export class Opponent {
 
     this.base = new THREE.Vector3();
     this.home = new THREE.Vector3();
+    this.com = new THREE.Vector3(); this.comVel = new THREE.Vector3();
+    this.plant = { footL: new THREE.Vector3(), footR: new THREE.Vector3() };
+    this._stepTo = new THREE.Vector3();
+    this.stepping = null; this.support = 1; this.offBalance = 0;
+    this.relax = { head: 0, body: 0 };
     this.moveVel = new THREE.Vector3();
     this.desiredVel = new THREE.Vector3();
     this.diff = DIFFICULTY.normal;
@@ -211,11 +223,14 @@ export class Opponent {
     this.staggerT = 0; this.circleDir = Math.random() < 0.5 ? -1 : 1; this.incoming = null; this.lastPunchAt = -10;
     this.cover = false; this.coverLow = false; this.coverLowT = 0; this.winded = 0;
     for (const h of this.handList) h.punch = null;
+    this.stepping = null;
+    for (const n of ['footL', 'footR']) { this.toWorld(_l.copy(this.local[n]), this.plant[n]); this.plant[n].y = this.local[n].y; }
     this.computeTargets(1 / 240, null);
     for (const name in this.p) {
       this.p[name].teleport(this.target[name]);
       this.lastTarget[name].copy(this.target[name]);
     }
+    this.support = 1; this.offBalance = 0; this.relax.head = this.relax.body = 0;
   }
 
   resetKeepHealth(x, z, yaw) {
@@ -256,20 +271,17 @@ export class Opponent {
       let dy = (r.yaw + Math.PI) - this.yaw;
       dy = Math.atan2(Math.sin(dy), Math.cos(dy));
       this.yaw += dy * (1 - Math.exp(-h * 16));
-    } else if (upright && this.tone > 0.3) {
-      this.moveVel.lerp(this.desiredVel, 1 - Math.exp(-h * 8));
-      this.base.addScaledVector(this.moveVel, h);
-      // Let the stance "give" when the body is shoved: base follows the real pelvis.
-      const pel = this.p.pelvis.pos, pt = this.target.pelvis;
-      this.base.x += (pel.x - pt.x) * 3 * h;
-      this.base.z += (pel.z - pt.z) * 3 * h;
+    } else if (upright) {
+      this.balanceStep(h);
       let dy = this.desiredYaw - this.yaw;
       dy = Math.atan2(Math.sin(dy), Math.cos(dy));
       this.yaw += Math.max(-6 * h, Math.min(6 * h, dy));
     } else {
       this.moveVel.set(0, 0, 0);
+      this.support = 1;
     }
-    clampToOctagon(this.base, 0.7);
+    if (this.remote) clampToOctagon(this.base, 0.7);
+    for (const r in this.relax) this.relax[r] = Math.max(0, this.relax[r] - h);
     // jumping (the superman punch)
     if (!this.remote && (this.jumpV > 0 || this.base.y > 0)) {
       this.jumpV -= 9.81 * h;
@@ -282,6 +294,100 @@ export class Opponent {
 
     this.computeTargets(h, ctx);
     this.applyMuscles(h);
+  }
+
+  /**
+   * Active-ragdoll balance (AI fighter). The body isn't anchored anywhere: its pose
+   * follows the real pelvis, its legs push against the floor (as far as grip allows)
+   * to move it, and its feet stay planted until a step is needed. Steps are taken
+   * to walk and turn, and to catch the body when the capture point (where it would
+   * have to put a foot to stop) leaves the feet. Weight is only held up while that
+   * balance holds; past it, support fades and it falls.
+   */
+  balanceStep(h) {
+    const p = this.p;
+    // centre of mass and its velocity
+    let M = 0, cx = 0, cz = 0, vx = 0, vz = 0;
+    for (const q of this.list) {
+      M += q.mass; cx += q.pos.x * q.mass; cz += q.pos.z * q.mass;
+      vx += (q.pos.x - q.prev.x) * q.mass; vz += (q.pos.z - q.prev.z) * q.mass;
+    }
+    cx /= M; cz /= M; vx /= M * h; vz /= M * h;
+    this.com.set(cx, 0, cz); this.comVel.set(vx, 0, vz);
+
+    // the pose frame rides on the real pelvis
+    const c = Math.cos(this.yaw), s = Math.sin(this.yaw);
+    const ox = this.slip * 0.15, oz = this.lean * 0.05;
+    this.base.x = p.pelvis.pos.x - (ox * c + oz * s);
+    this.base.z = p.pelvis.pos.z - (-ox * s + oz * c);
+
+    // which feet are on the floor
+    const kick = this.kickSlot.punch;
+    const onFloor = (n) => p[n].pos.y < p[n].radius + 0.04 && !(kick && kick.foot === n) && !(this.stepping && this.stepping.foot === n);
+    const gL = onFloor('footL'), gR = onFloor('footR');
+    const grounded = (gL ? 1 : 0) + (gR ? 1 : 0);
+
+    // capture point vs the support area: both feet (a foot mid-step counts where it's landing,
+    // since weight shifts onto it), plus foot size. A kicking foot doesn't count.
+    const w0 = Math.sqrt(9.81 / 1.0);
+    _w.set(cx + vx / w0, 0, cz + vz / w0);
+    const st = this.stepping;
+    const fL = st && st.foot === 'footL' ? st.to : this.plant.footL;
+    const fR = st && st.foot === 'footR' ? st.to : this.plant.footR;
+    let off;
+    if (kick) off = _w.distanceTo(_f.copy(kick.foot === 'footL' ? fR : fL).setY(0)) - 0.15;
+    else if (grounded || st) off = distToSegment(_w, fL, fR) - 0.15;
+    else off = this.base.y > 0.02 ? 0 : 0.3;   // mid-jump: fine; otherwise both feet are off the floor
+    this.offBalance += (Math.max(0, off) - this.offBalance) * (1 - Math.exp(-h * 30));
+    this.support = grounded || st || this.base.y > 0.02 ? THREE.MathUtils.clamp(1 - this.offBalance / 0.5, 0, 1) : 0.35;
+    // being off balance uses up balance (a kick does too); run out, or get knocked
+    // further than any step could catch, and you go down
+    this.balance -= this.offBalance * h * (kick ? 60 : 200);
+    if ((this.balance <= 0 || this.offBalance > 0.6) && this.mode === 'fight') { this.trip(); return; }
+
+    // legs push the body toward where the AI wants to go, limited by grip
+    if (grounded && this.tone > 0.3) {
+      let ax = (this.desiredVel.x - vx) * 6, az = (this.desiredVel.z - vz) * 6;
+      // feet can only push (or brake) as hard as their grip allows; off balance, even less
+      const lim = 0.5 * 9.81 * (grounded === 2 ? 1 : 0.6) * this.tone * (0.4 + 0.6 * this.support);
+      const al = Math.hypot(ax, az);
+      if (al > lim) { ax *= lim / al; az *= lim / al; }
+      for (const n of ['pelvis', 'belly', 'chest', 'hipL', 'hipR']) { p[n].force.x += ax * p[n].mass * M / 50; p[n].force.z += az * p[n].mass * M / 50; }
+    }
+    this.moveVel.copy(this.comVel);
+
+    // stepping
+    if (this.stepping) {
+      const st = this.stepping;
+      st.t += h;
+      if (st.t >= st.dur) { this.plant[st.foot].copy(st.to); this.stepping = null; }
+    } else if (!kick && this.tone > 0.5 && this.mode === 'fight' || (!kick && this.mode === 'idle')) {
+      // where each foot would like to be: its stance spot, a little ahead of where the body is heading
+      let best = null, bestErr = 0;
+      for (const n of ['footL', 'footR']) {
+        this.toWorld(_l.copy(this.local[n]), _x);
+        _x.x += vx * 0.25; _x.z += vz * 0.25; _x.y = this.local[n].y;   // step to where the body is going
+        const err = Math.hypot(_x.x - this.plant[n].x, _x.z - this.plant[n].z);
+        if (err > bestErr) { bestErr = err; best = n; this._stepTo.copy(_x); }
+      }
+      const urgent = this.offBalance > 0.02;
+      if (best && (bestErr > 0.17 || urgent)) {
+        if (urgent) {   // reach toward the capture point to catch the fall
+          this._stepTo.x += (_w.x - cx) * 0.6; this._stepTo.z += (_w.z - cz) * 0.6;
+        }
+        const from = this.plant[best];
+        const dx = this._stepTo.x - from.x, dz = this._stepTo.z - from.z, d = Math.hypot(dx, dz);
+        if (d > 0.62) { this._stepTo.x = from.x + (dx / d) * 0.62; this._stepTo.z = from.z + (dz / d) * 0.62; }
+        clampToOctagon(this._stepTo, 0.25);
+        this.stepping = { foot: best, from: from.clone(), to: this._stepTo.clone(), t: 0, dur: urgent ? 0.16 : 0.26 };
+      }
+    }
+  }
+
+  /** Put both feet down where they stand now (after a reset or getting up). */
+  replant() {
+    for (const n of ['footL', 'footR']) this.plant[n].set(this.p[n].pos.x, this.local[n].y, this.p[n].pos.z);
+    this.stepping = null;
   }
 
   computeTargets(h, ctx) {
@@ -309,7 +415,18 @@ export class Opponent {
     const mvx = this.moveVel.x * c - this.moveVel.z * s;   // move direction in local frame
     const mvz = this.moveVel.x * s + this.moveVel.z * c;
     const ml = Math.hypot(mvx, mvz) || 1;
+    const planted = !this.remote && (this.mode === 'fight' || this.mode === 'idle');
     for (const [name, ph] of [['footL', 0], ['footR', Math.PI]]) {
+      if (planted) {
+        const st = this.stepping;
+        if (st && st.foot === name) {
+          const u = smooth(Math.min(1, st.t / st.dur));
+          T[name].lerpVectors(st.from, st.to, u);
+          T[name].y = this.local[name].y + Math.sin(Math.PI * u) * 0.09;
+        } else T[name].copy(this.plant[name]);
+        T[name].y += this.base.y;   // (lifted along with a jump)
+        continue;
+      }
       const sn = Math.sin(this.stepPhase + ph);
       _l.copy(this.local[name]);
       _l.y += Math.max(0, sn) * 0.09 * amt;
@@ -448,12 +565,23 @@ export class Opponent {
 
   applyMuscles(h) {
     const tone = this.tone;
-    const grav = Math.min(1, tone * 1.25);
+    const support = this.remote ? 1 : this.support;
+    // Muscles are internal: they shape the pose but can't push the whole body around.
+    // Only the feet (through the floor) and the legs' drive move it, so a shove keeps its momentum.
+    const internal = !this.remote && (this.mode === 'fight' || this.mode === 'idle');
+    let sumX = 0, sumZ = 0, sumM = 0;
     for (const name in this.p) {
       const p = this.p[name];
       const T = this.target[name], LT = this.lastTarget[name];
       let w = p.omega, maxAcc = 75;
       if (p.hand) { w = p.hand.omega; maxAcc = p.hand.maxAcc; }
+      // arms and head are carried by the torso; the torso and legs only hold weight while balanced
+      const carried = p.hand || p.region === 'guard' || name === 'head' || name === 'neck';
+      const hold = carried ? 1 : 0.35 + 0.65 * support;
+      const grav = Math.min(1, tone * 1.25) * (carried ? 1 : support) * (name.startsWith('foot') ? 0 : 1);
+      // a hit relaxes the struck area for a moment: the head snaps, the body folds, then recovers
+      if (this.relax.head > 0 && (name === 'head' || name === 'neck')) { w *= 0.35; maxAcc *= 0.3; }
+      if (this.relax.body > 0 && (name === 'chest' || name === 'belly')) { w *= 0.55; maxAcc *= 0.5; }
       const k = this.kickSlot.punch;
       if (k && k.foot === name) {
         const P = this.remote ? 1 : this.diff.power * k.def.power;
@@ -468,9 +596,19 @@ export class Opponent {
       _f.addScaledVector(_l.subVectors(T, p.pos), w * w); // spring term
       const a = _f.length();
       if (a > maxAcc) _f.multiplyScalar(maxAcc / a);
-      p.force.addScaledVector(_f, p.mass * tone);
+      _f.multiplyScalar(p.mass * tone * hold);
+      p.force.add(_f);
       p.force.y += p.mass * G * grav;
+      if (internal && !name.startsWith('foot')) { sumX += _f.x; sumZ += _f.z; sumM += p.mass; }
       LT.copy(T);
+    }
+    if (internal && sumM > 0) {
+      const ax = sumX / sumM, az = sumZ / sumM;
+      for (const name in this.p) {
+        if (name.startsWith('foot')) continue;
+        const p = this.p[name];
+        p.force.x -= ax * p.mass; p.force.z -= az * p.mass;
+      }
     }
   }
 
@@ -655,6 +793,7 @@ export class Opponent {
     this.cons = Math.max(0, this.cons - (extra.cons ?? (region === 'head' ? dmg * 1.7 : dmg * 0.35)));
     this.balance -= (extra.bal || 0) * (1 + 0.8 * (1 - this.cons / 100));   // dazed fighters are easier to sweep
     this.lastHitT = this.clock;
+    this.relax[region === 'head' ? 'head' : 'body'] = Math.min(0.5, 0.15 + dmg * 0.012);
     if (region !== 'head') this.winded = Math.min(1, (this.winded || 0) + dmg * 0.05);
     if (this.balance <= 0 && this.mode === 'fight' && this.cons > 0 && this.health > 0) { this.trip(); return; }
     if (dmg > 5) {
@@ -691,6 +830,9 @@ export class Opponent {
     this.balance = Math.max(this.balance, 80);
     this.base.set(this.p.pelvis.pos.x, 0, this.p.pelvis.pos.z);
     clampToOctagon(this.base, 0.9);
+    // stand up over the feet: put them under the body, then let balance take over
+    for (const n of ['footL', 'footR']) { this.toWorld(_l.copy(this.local[n]), this.plant[n]); this.plant[n].y = this.local[n].y; }
+    this.stepping = null;
   }
 }
 
@@ -710,16 +852,28 @@ function basisQuat(xDir, yDir, out) {
   return out.setFromRotationMatrix(_m);
 }
 
+/** The human body template, built once and shared by every fighter. */
+let humanTemplate = null;
+export function getHumanTemplate() {
+  if (!humanTemplate) {
+    const J = Object.fromEntries(Object.entries(REST).map(([k, v]) => [k, [v[0], v[1], v[2]]]));
+    humanTemplate = buildHumanTemplate(J);
+  }
+  return humanTemplate;
+}
+
 class FighterView {
   constructor(scene, f) {
     this.f = f;
     this.group = new THREE.Group();
     scene.add(this.group);
-    const skin = new THREE.MeshStandardMaterial({ color: 0xb87a55, roughness: 0.55 });
+    // one continuous skinned body, posed from the ragdoll's particles
+    this.body = new SkinnedBody(scene, getHumanTemplate(), { skin: 0xb87a55, shorts: 0x9c1020, trim: 0xf2e6c8, hair: 0x1b1210 });
+    this.joints = f.p;   // particle name -> particle; positions read each frame
+    this.J = {};
+
     const shorts = new THREE.MeshStandardMaterial({ color: 0x9c1020, roughness: 0.4, metalness: 0.1 });
-    const trim = new THREE.MeshStandardMaterial({ color: 0xf2e6c8, roughness: 0.5 });
     const glove = new THREE.MeshPhysicalMaterial({ color: 0x141414, roughness: 0.35, clearcoat: 0.8, clearcoatRoughness: 0.25 });
-    const shoe = new THREE.MeshStandardMaterial({ color: 0xb87a55, roughness: 0.6, emissive: 0xff3010, emissiveIntensity: 0 });   // bare feet
     const dark = new THREE.MeshStandardMaterial({ color: 0x1b1210, roughness: 0.8 });
     const sphere = new THREE.SphereGeometry(1, 24, 16);
     const cyl = new THREE.CylinderGeometry(1, 1, 1, 12);
@@ -730,40 +884,14 @@ class FighterView {
       return m;
     };
 
-    this.limbs = [];
-    const limb = (a, b, r0, mat) => {
-      const m = add(cyl, mat);
-      this.limbs.push({ m, a: f.p[a], b: f.p[b], r: r0 });
-    };
-    limb('neck', 'head', 0.06, skin);
-    limb('shoulderL', 'elbowL', 0.058, skin); limb('shoulderR', 'elbowR', 0.058, skin);
-    limb('elbowL', 'handL', 0.048, skin); limb('elbowR', 'handR', 0.048, skin);
-    limb('hipL', 'kneeL', 0.08, skin); limb('hipR', 'kneeR', 0.08, skin);
-    limb('kneeL', 'footL', 0.058, skin); limb('kneeR', 'footR', 0.058, skin);
-
-    this.joints = [];
-    for (const [n, r] of [['shoulderL', 0.075], ['shoulderR', 0.075], ['elbowL', 0.055], ['elbowR', 0.055], ['kneeL', 0.068], ['kneeR', 0.068]]) {
-      const m = add(sphere, skin); m.scale.setScalar(r);
-      this.joints.push({ m, p: f.p[n] });
-    }
-
-    this.chest = add(sphere, skin); this.chest.scale.set(0.21, 0.19, 0.13);
-    this.abs = add(sphere, skin); this.abs.scale.set(0.165, 0.17, 0.115);
-    this.shorts = add(sphere, shorts); this.shorts.scale.set(0.19, 0.17, 0.14);
-    this.belt = add(cyl, trim); this.belt.scale.set(0.18, 0.05, 0.13);
-
-    // Head with a simple face
+    // face details ride on the head
     this.head = new THREE.Group(); this.group.add(this.head);
-    const skull = add(sphere, skin, this.head); skull.scale.set(0.105, 0.125, 0.115);
-    const hair = add(sphere, dark, this.head); hair.scale.set(0.108, 0.07, 0.112); hair.position.set(0, 0.06, -0.01);
     for (const sx of [-1, 1]) {
-      const eye = add(sphere, dark, this.head); eye.scale.setScalar(0.014); eye.position.set(sx * 0.038, 0.02, 0.103);
-      const brow = add(sphere, dark, this.head); brow.scale.set(0.03, 0.008, 0.01); brow.position.set(sx * 0.04, 0.045, 0.104);
-      const ear = add(sphere, skin, this.head); ear.scale.set(0.015, 0.03, 0.022); ear.position.set(sx * 0.105, 0.0, 0.0);
+      const eye = add(sphere, dark, this.head); eye.scale.set(0.012, 0.009, 0.006); eye.position.set(sx * 0.033, 0.006, 0.091);
+      const brow = add(sphere, dark, this.head); brow.scale.set(0.026, 0.006, 0.01); brow.position.set(sx * 0.034, 0.03, 0.098);
     }
-    const nose = add(sphere, skin, this.head); nose.scale.set(0.02, 0.028, 0.025); nose.position.set(0, -0.005, 0.118);
     const guard = add(sphere, new THREE.MeshStandardMaterial({ color: 0x2060ff, roughness: 0.3 }), this.head);
-    guard.scale.set(0.045, 0.015, 0.02); guard.position.set(0, -0.06, 0.1);
+    guard.scale.set(0.03, 0.009, 0.01); guard.position.set(0, -0.048, 0.092);
 
     this.gloves = [];
     for (const side of ['L', 'R']) {
@@ -775,36 +903,20 @@ class FighterView {
       const cuff = add(cyl, shorts, g); cuff.scale.set(0.058, 0.07, 0.058); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.085;
       this.gloves.push({ g, mat, handState: f.hands[side], hand: f.p['hand' + side], elbow: f.p['elbow' + side] });
     }
-    this.shoes = [];
-    for (const side of ['L', 'R']) {
-      const mat = shoe.clone();
-      const s = add(new THREE.BoxGeometry(0.09, 0.06, 0.22), mat);
-      // MMA fight shorts come down to mid-thigh
-      const leg = add(cyl, shorts);
-      this.shoes.push({ m: s, mat, name: 'foot' + side, foot: f.p['foot' + side], knee: f.p['knee' + side], hip: f.p['hip' + side], leg });
-    }
+    // a kicking foot glows as a warning
+    this.footGlow = ['L', 'R'].map((side) => {
+      const m = new THREE.Mesh(sphere, new THREE.MeshBasicMaterial({ color: 0xff5020, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
+      m.scale.set(0.07, 0.06, 0.14);
+      this.group.add(m);
+      return { m, name: 'foot' + side, foot: f.p['foot' + side], glow: 0 };
+    });
   }
 
   update() {
-    const p = this.f.p;
-    for (const l of this.limbs) {
-      _bx.subVectors(l.b.pos, l.a.pos);
-      const len = _bx.length() || 1e-4;
-      l.m.position.addVectors(l.a.pos, l.b.pos).multiplyScalar(0.5);
-      l.m.quaternion.setFromUnitVectors(Y, _bx.multiplyScalar(1 / len));
-      l.m.scale.set(l.r, len, l.r);
-    }
-    for (const j of this.joints) j.m.position.copy(j.p.pos);
-
-    const right = _w.subVectors(p.shoulderL.pos, p.shoulderR.pos);
-    const up = _f.subVectors(p.neck.pos, p.belly.pos);
-    basisQuat(right, up, _q);
-    this.chest.quaternion.copy(_q); this.chest.position.copy(p.chest.pos).addScaledVector(_by, 0.02);
-    this.abs.quaternion.copy(_q); this.abs.position.copy(p.belly.pos);
-
-    basisQuat(_w.subVectors(p.hipL.pos, p.hipR.pos), _f.subVectors(p.belly.pos, p.pelvis.pos), _q);
-    this.shorts.quaternion.copy(_q); this.shorts.position.copy(p.pelvis.pos).addScaledVector(_by, -0.02);
-    this.belt.quaternion.copy(_q); this.belt.position.copy(p.pelvis.pos).addScaledVector(_by, 0.11);
+    const p = this.f.p, J = this.J;
+    for (const k in p) J[k] = p[k].pos;
+    J.hipMid = null;
+    this.body.update(J);
 
     basisQuat(_w.subVectors(p.shoulderL.pos, p.shoulderR.pos), _f.subVectors(p.head.pos, p.neck.pos), _q);
     this.head.quaternion.copy(_q); this.head.position.copy(p.head.pos);
@@ -829,26 +941,14 @@ class FighterView {
       g.mat.emissiveIntensity = g.glow;
       g.g.scale.setScalar(1 + g.glow * 0.04);
     }
-    for (const s of this.shoes) {
-      const fwdx = Math.sin(this.f.yaw), fwdz = Math.cos(this.f.yaw);
-      _bz.set(fwdx, 0, fwdz);
-      _by.subVectors(s.knee.pos, s.foot.pos).normalize();
-      _bx.crossVectors(_by, _bz).normalize();
-      _bz.crossVectors(_bx, _by);
-      _m.makeBasis(_bx, _by, _bz);
-      s.m.quaternion.setFromRotationMatrix(_m);
-      s.m.position.copy(s.foot.pos).addScaledVector(_bz, 0.05);
-      s.m.position.y -= 0.02;
-      // the kicking foot glows as a warning, like his gloves
-      const k = this.f.kickSlot.punch;
-      const glow = k && k.foot === s.name ? (k.phase === 'wind' ? 0.5 + 2 * Math.min(1, k.t / k.wind) : k.phase === 'ext' ? 1.2 : 0) : 0;
-      s.mat.emissiveIntensity += (glow - s.mat.emissiveIntensity) * 0.35;
-      _bx.lerpVectors(s.hip.pos, s.knee.pos, 0.55);
-      _by.subVectors(_bx, s.hip.pos);
-      const len = _by.length() || 1e-4;
-      s.leg.position.addVectors(s.hip.pos, _bx).multiplyScalar(0.5);
-      s.leg.quaternion.setFromUnitVectors(Y, _by.multiplyScalar(1 / len));
-      s.leg.scale.set(0.1, len, 0.1);
+    const k = this.f.kickSlot.punch;
+    for (const fg of this.footGlow) {
+      const glow = k && k.foot === fg.name ? (k.phase === 'wind' ? 0.25 + 0.5 * Math.min(1, k.t / k.wind) : k.phase === 'ext' ? 0.55 : 0) : 0;
+      fg.glow += (glow - fg.glow) * 0.35;
+      fg.m.material.opacity = fg.glow;
+      fg.m.visible = fg.glow > 0.01;
+      fg.m.position.copy(fg.foot.pos);
+      fg.m.rotation.y = this.f.yaw;
     }
   }
 }

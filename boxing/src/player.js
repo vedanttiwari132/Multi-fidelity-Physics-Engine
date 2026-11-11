@@ -9,6 +9,8 @@
 import * as THREE from 'three';
 import { Particle, DistanceConstraint, solveTwoBone } from './physics.js';
 import { clampToOctagon } from './arena.js';
+import { SkinnedBody, buildArmTemplate } from './body.js';
+import { getHumanTemplate } from './fighter.js';
 
 export const PUNCHES = {
   straight: { wind: 0.0, ext: 0.14, ret: 0.2, cost: 8, power: 1.0 },
@@ -496,6 +498,9 @@ const _m = new THREE.Matrix4();
 const _bx = new THREE.Vector3(), _by = new THREE.Vector3(), _bz = new THREE.Vector3();
 const _el = new THREE.Vector3(), _pole = new THREE.Vector3(), _up = new THREE.Vector3();
 
+let armTpl = null;
+const armTemplate = () => armTpl || (armTpl = buildArmTemplate());
+
 class GloveView {
   constructor(scene, player) {
     this.player = player;
@@ -511,13 +516,15 @@ class GloveView {
       const knuckle = new THREE.Mesh(sphere, leather); knuckle.scale.set(0.068, 0.052, 0.045); knuckle.position.set(0, 0.022, 0.045);
       const fingers = new THREE.Mesh(sphere, skin); fingers.scale.set(0.062, 0.03, 0.035); fingers.position.set(0, -0.035, 0.055);
       const thumb = new THREE.Mesh(sphere, skin); thumb.scale.set(0.025, 0.028, 0.048); thumb.position.set(-g.side * 0.055, 0.0, 0.03);
-      const cuff = new THREE.Mesh(cyl, strap); cuff.scale.set(0.058, 0.07, 0.058); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.08;
-      group.add(body, knuckle, fingers, thumb, cuff);
-      const fore = new THREE.Mesh(cyl, skin);
-      const upper = new THREE.Mesh(cyl, skin);
-      for (const m of [body, knuckle, fingers, thumb, cuff, fore, upper]) { m.castShadow = true; m.receiveShadow = true; }
-      scene.add(group, fore, upper);
-      return { g, group, fore, upper };
+      const cuff = new THREE.Mesh(cyl, leather); cuff.scale.set(0.044, 0.045, 0.044); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.07;
+      const band = new THREE.Mesh(cyl, strap); band.scale.set(0.046, 0.012, 0.046); band.rotation.x = Math.PI / 2; band.position.z = -0.075;   // red wrist band
+      group.add(body, knuckle, fingers, thumb, cuff, band);
+      for (const m of [body, knuckle, fingers, thumb, cuff, band]) { m.castShadow = true; m.receiveShadow = true; }
+      scene.add(group);
+      // the arm, shoulder to wrist, as one skinned piece
+      const arm = new SkinnedBody(scene, armTemplate(), { skin: 0xd9a27c, shorts: 0xd9a27c, trim: 0xd9a27c, hair: 0xd9a27c });
+      const J = { shoulder: new THREE.Vector3(), elbow: new THREE.Vector3(), hand: new THREE.Vector3(), latA: new THREE.Vector3(), latB: new THREE.Vector3() };
+      return { g, group, arm, J };
     });
   }
 
@@ -538,8 +545,10 @@ class GloveView {
       it.group.quaternion.setFromRotationMatrix(_m);
       it.group.position.copy(gp);
 
-      placeCylinder(it.fore, _el, _v.copy(gp).addScaledVector(_bz, -0.08), 0.045);
-      placeCylinder(it.upper, sp, _el, 0.06);
+      const J = it.J;
+      J.shoulder.copy(sp); J.elbow.copy(_el); J.hand.copy(gp).addScaledVector(_bz, -0.07);
+      J.latB.copy(sp); J.latA.copy(sp).add(_v.set(1, 0, 0).applyQuaternion(camera.quaternion));
+      it.arm.update(J);
     }
   }
 }
@@ -597,34 +606,14 @@ function orient(obj, xDir, yDir) {
 class PlayerAvatar {
   constructor(scene, player) {
     this.player = player;
-    this.group = new THREE.Group();
-    this.group.visible = false;
-    scene.add(this.group);
-    const skin = new THREE.MeshStandardMaterial({ color: 0xd9a27c, roughness: 0.55 });
-    const shorts = new THREE.MeshStandardMaterial({ color: 0x1840c0, roughness: 0.4, metalness: 0.1 });
-    const trim = new THREE.MeshStandardMaterial({ color: 0xf4f1ea, roughness: 0.5 });
-    const dark = new THREE.MeshStandardMaterial({ color: 0x2a1a10, roughness: 0.8 });
-    const sphere = new THREE.SphereGeometry(1, 20, 14);
-    const cyl = new THREE.CylinderGeometry(1, 1, 1, 10);
-    const add = (geo, mat, parent = this.group) => { const m = new THREE.Mesh(geo, mat); m.castShadow = true; parent.add(m); return m; };
-    this.head = new THREE.Group(); this.group.add(this.head);
-    add(sphere, skin, this.head).scale.set(0.105, 0.125, 0.115);
-    const hair = add(sphere, dark, this.head); hair.scale.set(0.11, 0.075, 0.115); hair.position.set(0, 0.06, -0.015);
-    for (const sx of [-1, 1]) {
-      const eye = add(sphere, dark, this.head); eye.scale.setScalar(0.013); eye.position.set(sx * 0.038, 0.02, 0.103);
-      const ear = add(sphere, skin, this.head); ear.scale.set(0.015, 0.03, 0.022); ear.position.set(sx * 0.105, 0, 0);
-    }
-    const nose = add(sphere, skin, this.head); nose.scale.set(0.02, 0.028, 0.025); nose.position.set(0, -0.005, 0.118);
-    this.neck = add(cyl, skin);
-    this.chest = add(sphere, skin); this.chest.scale.set(0.21, 0.19, 0.13);
-    this.abs = add(sphere, skin); this.abs.scale.set(0.165, 0.17, 0.115);
-    this.shorts = add(sphere, shorts); this.shorts.scale.set(0.19, 0.17, 0.14);
-    this.belt = add(cyl, trim); this.belt.scale.set(0.18, 0.05, 0.13);
-    this.shoulders = [add(sphere, skin), add(sphere, skin)];
-    for (const m of this.shoulders) m.scale.setScalar(0.075);
+    // the same continuous skinned body as your opponent, in blue
+    this.body = new SkinnedBody(scene, getHumanTemplate(), { skin: 0xd9a27c, shorts: 0x1840c0, trim: 0xf4f1ea, hair: 0x2a1a10 });
+    this.body.visible = false;
+    this.group = this.body;   // .visible toggles the whole avatar
     this.phase = 0;   // stepping cycle, advanced by how fast you move (same as the opponent's)
-    this.legs = [-1, 1].map(() => ({ thigh: add(cyl, skin), shorts: add(cyl, shorts), shin: add(cyl, skin), knee: add(sphere, skin),
-      shoe: add(new THREE.SphereGeometry(1, 12, 8), skin) }));   // MMA: barefoot, fight shorts to mid-thigh
+    const V = () => new THREE.Vector3();
+    this.J = { head: V(), neck: V(), chest: V(), shoulderL: V(), shoulderR: V(), elbowL: V(), elbowR: V(), handL: V(), handR: V(),
+      belly: V(), pelvis: V(), hipL: V(), hipR: V(), kneeL: V(), kneeR: V(), footL: V(), footR: V() };
   }
 
   tick(dt) {
@@ -633,50 +622,46 @@ class PlayerAvatar {
   }
 
   update() {
-    const p = this.player;
+    const p = this.player, J = this.J;
     const yaw = p.yaw + p.twist;
     const sy = Math.sin(yaw), cy = Math.cos(yaw);
     const left = _p1.set(-cy, 0, sy);          // the player's left
     const fwd = _p2.set(-sy, 0, -cy);
-    const head = p.headAnchor.pos;
     const sL = p.gloves[0].shoulder.pos, sR = p.gloves[1].shoulder.pos;
-    const sMid = _p3.addVectors(sL, sR).multiplyScalar(0.5);
-    const hip = _p4.set(p.pos.x, 0.93 - p.duck * 0.6 - p.punchDuck * 0.5 + p.jumpY, p.pos.z);
-    const up = _v.subVectors(sMid, hip);
-
-    orient(this.chest, left, up); this.chest.position.copy(sMid).addScaledVector(_ay, -0.11);
-    orient(this.abs, left, up); this.abs.position.lerpVectors(sMid, hip, 0.62);
-    orient(this.shorts, left, up); this.shorts.position.copy(hip).addScaledVector(_ay, -0.02);
-    orient(this.belt, left, up); this.belt.position.copy(hip).addScaledVector(_ay, 0.11);
-    this.shoulders[0].position.copy(sL); this.shoulders[1].position.copy(sR);
-    _f.subVectors(head, sMid);
-    orient(this.head, left, _f); this.head.position.copy(head);
-    placeCylinder(this.neck, sMid, head, 0.06);
+    const hip = J.pelvis.set(p.pos.x, 0.93 - p.duck * 0.6 - p.punchDuck * 0.5 + p.jumpY, p.pos.z);
+    // your left glove is gloves[0]; the body's left arm is its +x side (its own left)
+    J.shoulderL.copy(sL).addScaledVector(left, 0.02); J.shoulderR.copy(sR).addScaledVector(left, -0.02);
+    const sMid = _p3.addVectors(J.shoulderL, J.shoulderR).multiplyScalar(0.5);
+    J.head.copy(p.headAnchor.pos);
+    J.neck.lerpVectors(sMid, J.head, 0.42);
+    J.chest.lerpVectors(sMid, hip, 0.3);
+    J.belly.lerpVectors(sMid, hip, 0.66);
+    J.handL.copy(p.gloves[0].particle.pos); J.handR.copy(p.gloves[1].particle.pos);
+    for (const [side, g] of [['L', p.gloves[0]], ['R', p.gloves[1]]]) {
+      _pole.set(0, -1, 0).addScaledVector(left, side === 'L' ? 0.7 : -0.7).addScaledVector(fwd, -0.3);
+      solveTwoBone(J['shoulder' + side], g.particle.pos, 0.33, 0.37, _pole, J['elbow' + side]);
+    }
 
     const speed = Math.hypot(p.vel.x, p.vel.z);
     const amt = Math.min(1, speed * 1.5);
     const mx = speed > 1e-4 ? p.vel.x / speed : 0, mz = speed > 1e-4 ? p.vel.z / speed : 0;
-    this.legs.forEach((leg, i) => {
-      const side = i === 0 ? 1 : -1;        // +1 = left
-      const ph = this.phase + (i === 0 ? 0 : Math.PI);
-      const fwdOff = side > 0 ? 0.17 : -0.15;
-      const hipJ = _t.copy(hip).addScaledVector(left, side * 0.11);
+    for (const side of ['L', 'R']) {
+      const sg = side === 'L' ? 1 : -1;        // +1 = left
+      const ph = this.phase + (sg > 0 ? 0 : Math.PI);
+      const fwdOff = sg > 0 ? 0.17 : -0.15;
+      const hipJ = J['hip' + side].copy(hip).addScaledVector(left, sg * 0.11);
+      hipJ.y -= 0.04;
       const shuffle = Math.cos(ph) * 0.08 * amt;
-      const foot = _b.set(p.pos.x + left.x * side * 0.15 + fwd.x * fwdOff + mx * shuffle,
+      const foot = J['foot' + side].set(p.pos.x + left.x * sg * 0.15 + fwd.x * fwdOff + mx * shuffle,
         0.07 + Math.max(0, Math.sin(ph)) * 0.09 * amt + p.jumpY,
-        p.pos.z + left.z * side * 0.15 + fwd.z * fwdOff + mz * shuffle);
-      _a.copy(fwd).addScaledVector(left, side * 0.25);
+        p.pos.z + left.z * sg * 0.15 + fwd.z * fwdOff + mz * shuffle);
+      _a.copy(fwd).addScaledVector(left, sg * 0.25);
       // the kicking leg (left leg is side -1 in the player's own terms) follows the real foot
-      const kicking = p.leg.particle.pos.y > 0.3 && (p.leg.side < 0) === (side > 0);
+      const kicking = p.leg.particle.pos.y > 0.3 && (p.leg.side < 0) === (sg > 0);
       if (kicking) { foot.copy(p.leg.particle.pos); _a.set(0, 0.5, 0).addScaledVector(fwd, 1); }
-      solveTwoBone(hipJ, foot, kicking ? 0.5 : 0.41, kicking ? 0.55 : 0.44, _a, _el);
-      placeCylinder(leg.thigh, hipJ, _el, 0.08);
-      placeCylinder(leg.shorts, hipJ, _p3.lerpVectors(hipJ, _el, 0.55), 0.098);
-      placeCylinder(leg.shin, _el, foot, 0.058);
-      leg.knee.position.copy(_el); leg.knee.scale.setScalar(0.068);
-      leg.shoe.position.copy(foot).addScaledVector(fwd, 0.04); leg.shoe.position.y = Math.max(0.04, foot.y - 0.02);
-      leg.shoe.scale.set(0.05, 0.045, 0.11);
-      leg.shoe.rotation.set(0, yaw, 0);
-    });
+      solveTwoBone(hipJ, foot, kicking ? 0.5 : 0.41, kicking ? 0.55 : 0.44, _a, J['knee' + side]);
+    }
+    J.hipMid = null;
+    this.body.update(J);
   }
 }
