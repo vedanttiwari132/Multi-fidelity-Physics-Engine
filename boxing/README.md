@@ -41,7 +41,15 @@ That writes `dist/index.html`, which works on any static host, or opened straigh
 
 ### How online play works there
 
-Outside claude.ai, two browsers connect directly to each other over WebRTC using [PeerJS](https://peerjs.com/). The host's match code is registered with PeerJS's free public matchmaking server, and the guest connects with that code, so you don't need a server of your own. Matches are joined by code; there's no list of open matches. On very strict networks (some offices and schools) a direct connection can fail; adding a TURN server fixes that. To use your own PeerJS server or a TURN server, set `window.KNOCKOUT_PEER` (PeerJS options, e.g. `{ host, port, path, secure, config: { iceServers: [...] } }`) before the game script runs.
+Outside claude.ai, two browsers connect directly to each other over WebRTC using [PeerJS](https://peerjs.com/). The host's match code is registered with PeerJS's free public matchmaking server and the guest connects with that code, so you don't need a server of your own. Matches are joined by code; there's no list of open matches. If the connection drops mid-fight, the game reconnects by itself and the round clock waits; a fighter only forfeits after 12 seconds without a connection.
+
+**Make it work on every network: add a relay.** Some networks (schools, offices, mobile carriers, some VPNs) block direct connections. A relay (TURN) server gets those players connected. Without your own, the game falls back to PeerJS's free relay, which only works on networks that allow UDP. To add a reliable one:
+
+1. Sign up for Metered's free Open Relay plan at <https://www.metered.ca/tools/openrelay/> (20 GB a month).
+2. Copy your TURN credentials URL (`https://<your-app>.metered.live/api/v1/turn/credentials?apiKey=...`). It is designed to be used from web pages.
+3. Paste it as `turnCredentialsUrl` in `src/netconfig.js` (then rebuild if you host `dist/`), or add `<script>window.KNOCKOUT_NET = { turnCredentialsUrl: '...' }</script>` to the page before the game's script.
+
+To use your own PeerJS server instead of the public one, set `window.KNOCKOUT_PEER` (PeerJS options such as `{ host, port, path, secure }`).
 
 On the claude.ai page the game uses the artifact `room` capability instead, which also lists open matches.
 
@@ -73,7 +81,8 @@ On the claude.ai page the game uses the artifact `room` capability instead, whic
 | `src/player.js` | First-person controller, PD-driven gloves, punch trajectories, head-recoil springs |
 | `src/arena.js` | Ring, physical ropes, lights, crowd |
 | `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, rounds / knockdowns, knockout cam, online match flow, HUD, input |
-| `src/net.js` | Hosting and joining matches: claude.ai `room` capability, or PeerJS (WebRTC) everywhere else |
+| `src/net.js` | Hosting and joining matches: claude.ai `room` capability, or PeerJS (WebRTC) everywhere else, with retries and reconnects |
+| `src/netconfig.js` | Relay (TURN) settings for online play outside claude.ai |
 | `build.mjs` | Bundles everything into `dist/index.html` for static hosting |
 | `src/audio.js` | Synthesised WebAudio sound effects (no asset files) |
 

@@ -648,7 +648,7 @@ function hostTick(dt, dtReal) {
       if (mp.phaseT > 2.2) set('fight');
       break;
     case 'fight':
-      m.timer = Math.max(0, m.timer - dt);
+      if (!mp.silent) m.timer = Math.max(0, m.timer - dt);   // the clock waits while the connection is down
       if (player.mode === 'down') { m.down = 'host'; m.count = 0; mp.countT = 0; set('knockdown'); }
       else if (rmode === 'down') { m.down = 'guest'; m.count = 0; mp.countT = 0; set('knockdown'); }
       else if (m.timer <= 0) {
@@ -770,23 +770,33 @@ function mpUpdate(dt, dtReal, now) {
   } else {
     rp = others.find((p) => p.presence?.role === 'host') || null;
   }
-  if (rp && readRemote(rp)) mp.lastSeen = now;
+  // `t` is when their latest state arrived; a held copy from a dropped link doesn't count as hearing them.
+  if (rp && readRemote(rp)) mp.lastSeen = Math.max(mp.lastSeen, rp.t ?? now);
+  mp.silent = mp.started && now - mp.lastSeen > 1500;
 
   if (!mp.started) {
     if (mp.role === 'guest') {
       const me = net.myPeer();
       const noMatch = `No open match found with code ${String(net.code).toUpperCase()}.`;
       if (net.full || (rp && mp.rs?.opp && me && mp.rs.opp !== me)) { lobbyError('That match already has two fighters.'); return; }
-      if (net.unreachable) { lobbyError(noMatch); return; }
+      if (net.unreachable || net.failReason === 'unreachable') { lobbyError(noMatch); return; }
+      if (net.failReason === 'blocked') {
+        lobbyError(net.hasRelay
+          ? "Couldn't connect to that match: one of your networks is blocking the connection. Try a different network."
+          : "Couldn't connect to that match: one of your networks blocks direct connections, and this copy of the game has no relay server set up.");
+        return;
+      }
       if (rp && me && mp.rs?.opp === me && mp.rs.m && mp.rs.m.phase !== 'waiting') beginOnlineMatch();
-      // a direct connection can take a few seconds to set up
-      else if (!rp && now - mp.joinT > (net.kind === 'p2p' ? 15000 : 8000)) { lobbyError(noMatch); return; }
+      // a direct connection can take a while to set up (the game retries a few times)
+      else if (!rp && now - mp.joinT > (net.kind === 'p2p' ? 40000 : 8000)) { lobbyError(noMatch); return; }
     } else {
       hostTick(dt, dtReal);
       if (mp.m.phase !== 'waiting') beginOnlineMatch();
     }
   } else {
-    if (now - mp.lastSeen > 4000 && game.phase !== 'over') { opponentLeft(); return; }
+    $('netwarn').hidden = !(mp.silent && game.phase !== 'over');
+    // a dropped link gets time to reconnect before it counts as leaving
+    if (now - mp.lastSeen > 12000 && game.phase !== 'over') { $('netwarn').hidden = true; opponentLeft(); return; }
     if (mp.rs) { syncRemoteMode(); readConfirms(mp.rs.hit); }
     if (mp.role === 'host') hostTick(dt, dtReal);
     applyMatch(mp.role === 'host' ? mp.m : mp.rs?.m);
@@ -803,7 +813,7 @@ function mpUpdate(dt, dtReal, now) {
     }
   }
   // While the replay is on screen the bodies hold replayed poses, so only the match clock is sent.
-  if (game.phase === 'kocam') { if (mp.role === 'host') net.send({ m: mp.m }, now); }
+  if (game.phase === 'kocam') net.send(mp.role === 'host' ? { m: mp.m, hb: Math.round(now / 250) } : { hb: Math.round(now / 250) }, now);
   else net.send(myState(), now);
 }
 
@@ -912,6 +922,7 @@ function lobbyError(msg) {
 }
 
 async function mpLeave(toLobby = false) {
+  $('netwarn').hidden = true;
   await net.leave();
   resetMp(null);
   opp.remote = null;

@@ -13,11 +13,13 @@
 // Either way each fighter keeps one state object (its "presence") and sends the
 // whole thing about 30 times a second; the other side reads the latest copy.
 
+import { NET_CONFIG, STUN_SERVERS, FALLBACK_RELAY } from './netconfig.js';
+
 const ROOM_PREFIX = 'km-';
 const PEER_PREFIX = 'knockout-physics-';
 const CODE_RE = /^[a-z0-9]{4,8}$/;
 const CODE_CHARS = 'abcdefghjkmnpqrstuvwxyz23456789';
-const STALE_MS = 3000;
+const STALE_MS = 15000;   // how long a silent opponent is kept around while reconnecting
 
 const newCode = () => Array.from({ length: 5 }, () => CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]).join('');
 
@@ -51,6 +53,10 @@ export class Net {
   get full() { return !!this.t?.full; }
   /** The code didn't reach anyone (p2p only; the room just stays empty). */
   get unreachable() { return !!this.t?.unreachable; }
+  /** Why joining failed (p2p): 'unreachable' (no such code) or 'blocked' (the networks couldn't connect). */
+  get failReason() { return this.t?.failReason ?? null; }
+  /** A relay (TURN) server is configured, so strict networks can still connect (p2p). */
+  get hasRelay() { return !!this.t?.hasRelay; }
 
   openMatches() { return this.t?.openMatches?.() ?? []; }
   async host(name) { this.name = cleanName(name); return this.t.host(this.name); }
@@ -128,8 +134,12 @@ class RoomTransport {
   }
 
   myPeer() { return this.match?.peers().find((p) => p.sameTab)?.peer ?? null; }
-  // another tab of yours counts as another player
-  others() { return this.match ? this.match.peers().filter((p) => !p.sameTab) : []; }
+  // Another tab of yours counts as another player. `t` = when their state last changed, on performance.now()'s clock.
+  others() {
+    if (!this.match) return [];
+    const skew = performance.now() - Date.now();
+    return this.match.peers().filter((p) => !p.sameTab).map((p) => ({ peer: p.peer, presence: p.presence, sameTab: false, t: p.updatedAt + skew }));
+  }
 
   send(patch, now) {
     if (!this.match || now - this.lastSend < 33) return;
@@ -139,13 +149,17 @@ class RoomTransport {
 }
 
 // ---------------------------------------------------------------------------
+const validIce = (x) => x && typeof x === 'object' && (typeof x.urls === 'string' || Array.isArray(x.urls));
+const isRelay = (x) => [].concat(x.urls).some((u) => /^turns?:/.test(String(u)));
+
 class PeerTransport {
   constructor() {
     this.Peer = null; this.peer = null; this.conns = new Map(); this.remote = new Map();
     this.state = {}; this.role = null; this.code = null; this.lastSend = 0;
-    this.full = false; this.unreachable = false;
-    // Optional override, e.g. your own PeerJS server: window.KNOCKOUT_PEER = { host, port, path, secure }
-    this.opts = { debug: 0, ...(typeof window !== 'undefined' && window.KNOCKOUT_PEER ? window.KNOCKOUT_PEER : {}) };
+    this.full = false; this.unreachable = false; this.failReason = null; this.hasRelay = false;
+    this.conn = null; this.attempts = 0; this.everConnected = false; this.iceFailed = false;
+    this.redialTimer = null; this.reconnectTimer = null; this.leaving = false;
+    this.ice = null; this.iceAt = 0;
   }
 
   async init() {
@@ -157,27 +171,76 @@ class PeerTransport {
     return !!this.Peer;
   }
 
-  openPeer(id) {
+  settings() {
+    const w = typeof window !== 'undefined' ? window : {};
+    return { ...NET_CONFIG, ...(w.KNOCKOUT_NET || {}) };
+  }
+
+  /** STUN servers plus a relay: from the credentials URL, the configured list, or PeerJS's fallback. */
+  async iceServers() {
+    if (this.ice && performance.now() - this.iceAt < 10 * 60e3) return this.ice;
+    const cfg = this.settings();
+    let relays = (Array.isArray(cfg.iceServers) ? cfg.iceServers : []).filter(validIce);
+    if (cfg.turnCredentialsUrl) {
+      try {
+        const ctl = new AbortController();
+        const timer = setTimeout(() => ctl.abort(), 5000);
+        const res = await fetch(cfg.turnCredentialsUrl, { signal: ctl.signal, cache: 'no-store' });
+        clearTimeout(timer);
+        const list = res.ok ? await res.json() : null;
+        if (Array.isArray(list)) relays = relays.concat(list.filter(validIce));
+      } catch { /* relay service unreachable: carry on with what we have */ }
+    }
+    this.hasRelay = relays.some(isRelay);
+    this.ice = [...STUN_SERVERS, ...relays, ...(this.hasRelay ? [] : [FALLBACK_RELAY])];
+    this.iceAt = performance.now();
+    return this.ice;
+  }
+
+  async options() {
+    const opts = { debug: 0, config: { iceServers: await this.iceServers(), sdpSemantics: 'unified-plan' } };
+    // Optional override, e.g. your own PeerJS server: window.KNOCKOUT_PEER = { host, port, path, secure }
+    const w = typeof window !== 'undefined' ? window : {};
+    return { ...opts, ...(w.KNOCKOUT_PEER || {}) };
+  }
+
+  openPeer(id, opts) {
     return new Promise((resolve, reject) => {
-      const p = id ? new this.Peer(id, this.opts) : new this.Peer(this.opts);
+      const p = id ? new this.Peer(id, opts) : new this.Peer(opts);
       const timer = setTimeout(() => { p.destroy(); reject(new Error('timeout')); }, 12000);
       p.once('open', () => { clearTimeout(timer); resolve(p); });
       p.once('error', (e) => { clearTimeout(timer); p.destroy(); reject(e); });
     });
   }
 
+  /** Keep the link to the matchmaking server alive (needed to accept or re-dial connections). */
   watch(peer) {
-    peer.on('error', (e) => { if (e?.type === 'peer-unavailable') this.unreachable = true; });
-    // Lost the matchmaking server (not the opponent): try to get back.
-    peer.on('disconnected', () => { if (this.peer === peer && !peer.destroyed) { try { peer.reconnect(); } catch { /* ignore */ } } });
+    peer.on('error', (e) => {
+      // "No one has that code": only meaningful before we ever connected.
+      if (e?.type === 'peer-unavailable' && !this.everConnected) this.unreachable = true;
+    });
+    peer.on('disconnected', () => this.keepRegistered(peer));
+  }
+
+  keepRegistered(peer) {
+    if (this.reconnectTimer || this.leaving || this.peer !== peer || peer.destroyed) return;
+    const tryAgain = () => {
+      this.reconnectTimer = null;
+      if (this.leaving || this.peer !== peer || peer.destroyed || !peer.disconnected) return;
+      try { peer.reconnect(); } catch { /* retried below */ }
+      this.reconnectTimer = setTimeout(tryAgain, 3000);
+    };
+    this.reconnectTimer = setTimeout(tryAgain, 500);
   }
 
   async host() {
+    this.leaving = false;
+    const opts = await this.options();
     let lastErr = null;
     for (let i = 0; i < 4 && !this.peer; i++) {
       const code = newCode();
       try {
-        this.peer = await this.openPeer(PEER_PREFIX + code);
+        this.peer = await this.openPeer(PEER_PREFIX + code, opts);
         this.code = code;
       } catch (e) {
         lastErr = e;
@@ -192,10 +255,14 @@ class PeerTransport {
   }
 
   accept(conn) {
-    if (this.conns.size >= 1) {   // one opponent per match
+    const current = [...this.conns.keys()];
+    if (current.length && !current.includes(conn.peer)) {   // one opponent per match
       conn.on('open', () => { try { conn.send({ full: true }); } catch { /* ignore */ } setTimeout(() => conn.close(), 500); });
       return;
     }
+    // Your opponent reconnecting: the new connection replaces the old one.
+    const old = this.conns.get(conn.peer);
+    if (old) { this.conns.delete(conn.peer); try { old.close(); } catch { /* ignore */ } }
     this.wire(conn);
   }
 
@@ -207,31 +274,63 @@ class PeerTransport {
       if (d.full === true) { this.full = true; return; }
       this.remote.set(conn.peer, { presence: Object.freeze(d), t: performance.now() });
     });
-    const drop = () => { this.conns.delete(conn.peer); this.remote.delete(conn.peer); };
+    conn.on('iceStateChanged', (st) => { if (st === 'failed') this.iceFailed = true; });
+    const drop = () => { if (this.conns.get(conn.peer) === conn) this.conns.delete(conn.peer); };
     conn.on('close', drop);
     conn.on('error', drop);
   }
 
   async join(code) {
-    this.peer = await this.openPeer(null);
+    this.leaving = false;
+    this.peer = await this.openPeer(null, await this.options());
     this.watch(this.peer);
     this.role = 'guest';
     this.code = code;
-    this.wire(this.peer.connect(PEER_PREFIX + code, { reliable: false, serialization: 'json' }));
+    this.dial();
+  }
+
+  /** Guest: connect to the host, retrying a few times, and again whenever the link drops. */
+  dial() {
+    if (this.leaving || !this.peer || this.peer.destroyed) return;
+    this.attempts++;
+    const conn = this.peer.connect(PEER_PREFIX + this.code, { reliable: false, serialization: 'json' });
+    this.conn = conn;
+    this.wire(conn);
+    const timer = setTimeout(() => { if (!conn.open) { try { conn.close(); } catch { /* ignore */ } this.redial(conn); } }, 9000);
+    conn.on('open', () => { clearTimeout(timer); this.attempts = 0; this.everConnected = true; this.iceFailed = false; });
+    conn.on('close', () => { clearTimeout(timer); this.redial(conn); });
+    conn.on('error', () => { clearTimeout(timer); this.redial(conn); });
+  }
+
+  redial(conn) {
+    if (conn !== this.conn || this.leaving || this.redialTimer || !this.peer || this.peer.destroyed) return;
+    if (!this.everConnected && (this.unreachable || this.attempts >= 3)) {
+      // The matchmaking server found the code (otherwise it says "unavailable"), so the
+      // host exists and it's the connection between the two networks that failed.
+      this.failReason = this.unreachable ? 'unreachable' : 'blocked';
+      return;
+    }
+    const delay = Math.min(4000, 400 * 2 ** Math.min(3, this.attempts));
+    this.redialTimer = setTimeout(() => { this.redialTimer = null; this.dial(); }, delay);
   }
 
   async leave() {
+    this.leaving = true;
+    clearTimeout(this.redialTimer); clearTimeout(this.reconnectTimer);
+    this.redialTimer = this.reconnectTimer = null;
     for (const c of this.conns.values()) { try { c.close(); } catch { /* ignore */ } }
     try { this.peer?.destroy(); } catch { /* ignore */ }
-    this.peer = null; this.conns.clear(); this.remote.clear(); this.state = {};
-    this.role = null; this.code = null; this.full = false; this.unreachable = false;
+    this.peer = null; this.conn = null; this.conns.clear(); this.remote.clear(); this.state = {};
+    this.role = null; this.code = null; this.full = false; this.unreachable = false; this.failReason = null;
+    this.attempts = 0; this.everConnected = false; this.iceFailed = false;
   }
 
   myPeer() { return this.peer?.id ?? null; }
 
+  /** Includes a few seconds of the last state heard, with `t` = when it arrived. */
   others() {
     const now = performance.now(), out = [];
-    for (const [peer, v] of this.remote) if (now - v.t < STALE_MS) out.push({ peer, presence: v.presence, sameTab: false });
+    for (const [peer, v] of this.remote) if (now - v.t < STALE_MS) out.push({ peer, presence: v.presence, sameTab: false, t: v.t });
     return out;
   }
 
