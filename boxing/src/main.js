@@ -8,6 +8,10 @@ import { Arena } from './arena.js';
 import { Sfx } from './audio.js';
 import { PhysicsDebugView } from './debug.js';
 import { Net, cleanName } from './net.js';
+import { TouchControls, isTouchDevice } from './touch.js';
+
+const TOUCH = isTouchDevice();
+if (TOUCH) document.body.classList.add('touch');
 
 const STEP = 1 / 240;      // physics rate
 const MAX_STEPS = 16;
@@ -18,7 +22,7 @@ const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------- setup
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, TOUCH ? 1.5 : 2));   // phones: lighter rendering
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -181,7 +185,16 @@ function onPlayerStruck(hand, speed, imp, region) {
 }
 
 // ---------------------------------------------------------------- rules
+/** Phones: go fullscreen and sideways when a fight starts (needs a tap, so call from one). */
+function goFullscreen() {
+  if (!TOUCH || document.fullscreenElement) return;
+  const el = document.documentElement;
+  const p = el.requestFullscreen?.({ navigationUI: 'hide' });
+  if (p && p.then) p.then(() => screen.orientation?.lock?.('landscape').catch(() => {})).catch(() => {});
+}
+
 function startMatch() {
+  goFullscreen();
   sfx.init();
   opp.setDifficulty(game.difficulty);
   player.reset(0, 1.45, 0);
@@ -248,7 +261,7 @@ function playerKnockdown() {
     sfx.crowdCheer(1.2);
     arena.excitement = 1.6;
     $('recover').classList.remove('hidden');
-    $('recover-text').textContent = player.knockdowns >= 3 ? 'STAY DOWN…' : 'MASH SPACE TO GET UP';
+    $('recover-text').textContent = player.knockdowns >= 3 ? 'STAY DOWN…' : GET_UP_TEXT;
     banner("YOU'RE DOWN!");
     return;
   }
@@ -262,7 +275,7 @@ function playerKnockdown() {
   sfx.crowdCheer(1.2);
   arena.excitement = 1.6;
   $('recover').classList.remove('hidden');
-  $('recover-text').textContent = player.knockdowns >= 3 ? 'STAY DOWN…' : 'MASH SPACE TO GET UP';
+  $('recover-text').textContent = player.knockdowns >= 3 ? 'STAY DOWN…' : GET_UP_TEXT;
   banner("YOU'RE DOWN!");
 }
 
@@ -936,7 +949,10 @@ async function mpLeave(toLobby = false) {
 
 // ---------------------------------------------------------------- incoming punch warning
 const THREAT_DIR = { jab: 't', cross: 't', hookL: 'r', hookR: 'l', bodyR: 'b', upperR: 'b' };
-const THREAT_HINT = {
+const GET_UP_TEXT = TOUCH ? 'TAP ANY BUTTON TO GET UP' : 'MASH SPACE TO GET UP';
+const THREAT_HINT = TOUCH ? {
+  jab: 'SLIP  ◀ ▶', cross: 'SLIP  ◀ ▶', hookL: 'DUCK', hookR: 'DUCK', bodyR: 'GUARD', upperR: 'SLIP  ◀ ▶',
+} : {
   jab: 'SLIP  ⇧ + CLICK', cross: 'SLIP  ⇧ + CLICK', hookL: 'DUCK  C', hookR: 'DUCK  C',
   bodyR: 'BLOCK  SPACE', upperR: 'SLIP  ⇧ + CLICK',
 };
@@ -1047,7 +1063,7 @@ function setOverlay(v) {
   if (!v) $('pause').classList.add('hidden');
 }
 
-$('resume').addEventListener('click', () => { game.paused = false; setOverlay(false); lockPointer(); });
+$('resume').addEventListener('click', () => { game.paused = false; setOverlay(false); goFullscreen(); lockPointer(); });
 $('leave').addEventListener('click', () => { game.paused = false; setOverlay(false); if (mp.on) mpLeave(); else toMenu(); });
 
 document.addEventListener('mousemove', (e) => {
@@ -1136,6 +1152,21 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
+// ---------------------------------------------------------------- touch
+if (TOUCH) {
+  game.noLock = true;   // no mouse to lock
+  scene.traverse((o) => { if (o.isLight && o.castShadow) o.shadow.mapSize.set(1024, 1024); });
+}
+const touch = TOUCH ? new TouchControls({
+  root: $('touch'),
+  player,
+  active: () => inMatch() && !game.paused && !game.overlay && game.phase !== 'kocam',
+  onPress: () => { if (inMatch() && player.mode === 'down' && player.knockdowns < 3) player.recover += 0.085; },
+  onPause: () => { if (inMatch()) setPaused(true); },
+}) : null;
+// tap to skip the knockout replay
+document.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'mouse' && game.phase === 'kocam') ko.skip = true; });
+
 // ---------------------------------------------------------------- loop
 function updatePhase(dt, dtReal) {
   if (mp.on) {
@@ -1184,7 +1215,7 @@ let acc = 0;
 renderer.setAnimationLoop((now) => {
   const dtReal = Math.min(0.05, (now - last) / 1000);
   last = now;
-  if (game.paused && !mp.on) { renderer.render(scene, camera); return; }
+  if (game.paused && !mp.on) { touch?.setVisible(false); renderer.render(scene, camera); return; }
   if (mp.on) mpUpdate(dtReal, dtReal, now);
   if (game.phase === 'kocam') {
     updateKoCam(dtReal);
@@ -1225,6 +1256,7 @@ renderer.setAnimationLoop((now) => {
     updateHud(dtReal);
     updateThreat();
   }
+  touch?.setVisible(inMatch() && !game.paused && !game.overlay && game.phase !== 'kocam');
   renderer.render(scene, camera);
 });
 

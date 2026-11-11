@@ -70,6 +70,8 @@ On the claude.ai page the game uses the artifact `room` capability instead, whic
 | M | Mute |
 | Esc or P | Pause / leave the match |
 
+**Phones and tablets** (hold it sideways): left thumb moves (the stick appears where you touch), drag on the right side to look. The **LEFT** and **RIGHT** buttons throw with each glove: tap for a jab / cross, swipe sideways for a hook, up for an uppercut, down for a body hook. Hold **GUARD** or **DUCK**, tap **◀ SLIP ▶** to slip, and tap any button to get up after a knockdown. **II** pauses.
+
 3 rounds × 90 s. Knockout = no get-up by the count of 10; a third knockdown ends it. Otherwise it goes to a decision on damage.
 
 ## Code layout
@@ -82,6 +84,7 @@ On the claude.ai page the game uses the artifact `room` capability instead, whic
 | `src/arena.js` | Ring, physical ropes, lights, crowd |
 | `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, rounds / knockdowns, knockout cam, online match flow, HUD, input |
 | `src/net.js` | Hosting and joining matches: claude.ai `room` capability, or PeerJS (WebRTC) everywhere else, with retries and reconnects |
+| `src/touch.js` | On-screen controls for phones and tablets |
 | `src/netconfig.js` | Relay (TURN) settings for online play outside claude.ai |
 | `build.mjs` | Bundles everything into `dist/index.html` for static hosting |
 | `src/audio.js` | Synthesised WebAudio sound effects (no asset files) |

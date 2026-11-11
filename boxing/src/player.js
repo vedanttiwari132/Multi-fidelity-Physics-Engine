@@ -134,6 +134,7 @@ export class Player {
       if (k.has('KeyS')) fz -= 1;
       if (k.has('KeyD')) fx += 1;
       if (k.has('KeyA')) fx -= 1;
+      if (this.touchMove) { fx += this.touchMove.x; fz += this.touchMove.y; }   // on-screen joystick
     }
     const sy = Math.sin(this.yaw), cy = Math.cos(this.yaw);
     let wx = fx * cy - fz * sy, wz = -fx * sy - fz * cy;
