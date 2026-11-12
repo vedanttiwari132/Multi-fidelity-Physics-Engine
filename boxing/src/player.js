@@ -7,9 +7,38 @@
 // actual impact velocity: range, timing, footwork and stamina all matter.
 
 import * as THREE from 'three';
-import { Particle, DistanceConstraint, solveTwoBone } from './physics.js';
+import RAPIER from './rapier.js';
+import { solveTwoBone } from './physics.js';
+import { interactionGroups, GROUP } from './sim.js';
 import { SkinnedBody, buildArmTemplate, makeGlove, toonMaterial } from './body.js';
 import { Opponent } from './fighter.js';
+
+/** A Rapier body seen as a point ({ pos, prev, getVelocity }), refreshed after every step. */
+class BodyPoint {
+  constructor(body, mass, radius, name) {
+    this.body = body; this.mass = mass; this.radius = radius; this.name = name;
+    this.pos = new THREE.Vector3(); this.prev = new THREE.Vector3();
+    this.sync(); this.prev.copy(this.pos);
+  }
+  sync() { this.prev.copy(this.pos); const t = this.body.translation(); this.pos.set(t.x, t.y, t.z); }
+  getVelocity(dt, out = new THREE.Vector3()) { const v = this.body.linvel(); return out.set(v.x, v.y, v.z); }
+  teleport(p) {
+    this.body.setTranslation({ x: p.x, y: p.y, z: p.z }, true);
+    this.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    this.pos.copy(p); this.prev.copy(p);
+  }
+}
+
+/** A kinematic anchor (shoulder, hip, your head): moved by the game each step. */
+class Anchor {
+  constructor(world, collider) {
+    this.body = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased());
+    if (collider) world.createCollider(collider, this.body);
+    this.pos = new THREE.Vector3();
+  }
+  moveKinematic(v) { this.pos.copy(v); this.body.setNextKinematicTranslation({ x: v.x, y: v.y, z: v.z }); }
+  teleport(v) { this.pos.copy(v); this.body.setTranslation({ x: v.x, y: v.y, z: v.z }, true); }
+}
 
 export const PUNCHES = {
   straight: { wind: 0.0, ext: 0.14, ret: 0.2, cost: 8, power: 1.0 },
@@ -24,6 +53,7 @@ export const KICK = { wind: 0.12, ext: 0.2, ret: 0.3, cost: 15, power: 1.3 };
 const LEG = 1.05;   // hip to foot, fully extended
 
 const ARM = 0.72;
+const HEAD_BACK = 0.06;   // your head's centre, behind your eyes
 const smooth = (u) => u * u * (3 - 2 * u);
 const _v = new THREE.Vector3();
 const _f = new THREE.Vector3();
@@ -35,7 +65,9 @@ const _a = new THREE.Vector3();
 const _b = new THREE.Vector3();
 
 export class Player {
-  constructor(world, scene) {
+  constructor(phys, scene) {
+    this.phys = phys;
+    const world = phys.world;
     this.world = world;
     this.pos = new THREE.Vector3();
     this.vel = new THREE.Vector3();
@@ -59,31 +91,52 @@ export class Player {
     this.onDash = null;   // (dir) => void
     this.legPos = new THREE.Vector3();   // thighs and knees: what low kicks hit
 
-    this.headAnchor = world.addParticle(new Particle(new THREE.Vector3(), { mass: 0, radius: 0.12, name: 'playerHead' }));
+    // Your head: a kinematic ball where your skull is (centred a little behind your eyes).
+    // Only his fists, feet and head meet it.
+    this.headCenter = new THREE.Vector3();
+    this.headAnchor = new Anchor(world, null);
+    const headCol = world.createCollider(RAPIER.ColliderDesc.ball(0.13).setCollisionGroups(interactionGroups(GROUP.PHEAD))
+      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS | RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(1), this.headAnchor.body);
+    phys.register(headCol, { kind: 'phead', region: 'head', owner: this });
+    // Your gloves (and kicking foot) are solid balls driven toward where the punch wants them,
+    // held at arm's length from a shoulder by a rope joint. They are what hits and blocks.
+    const ball = (mass, info, ccd = true) => {
+      const body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setGravityScale(0).setLinearDamping(0.6).setCcdEnabled(ccd).setCanSleep(false));
+      const col = world.createCollider(RAPIER.ColliderDesc.ball(0.09).setMass(mass).setFriction(0.3).setRestitution(0.15)
+        .setCollisionGroups(interactionGroups(GROUP.GLOVE))
+        .setActiveHooks(RAPIER.ActiveHooks.FILTER_CONTACT_PAIRS)
+        .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS | RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(1), body);
+      phys.register(col, info);
+      phys.recorded.push(body);
+      phys.tracked.add(body);
+      body.lockRotations(true, true);
+      body.setDominanceGroup(1);   // as solid as a standing fighter (see Ragdoll.setDominance)
+      return body;
+    };
     this.gloves = [-1, 1].map((side) => {
-      const shoulder = world.addParticle(new Particle(new THREE.Vector3(), { mass: 0, name: 'playerShoulder' }));
-      const particle = world.addParticle(new Particle(new THREE.Vector3(), {
-        mass: 3, radius: 0.09, gravityScale: 0, friction: 0.3, damping: 0.004, name: side < 0 ? 'gloveL' : 'gloveR',
-      }));
-      particle.isPlayerGlove = true;
-      world.addConstraint(new DistanceConstraint(shoulder, particle, { length: ARM, mode: 'max' }));
-      world.addConstraint(new DistanceConstraint(this.headAnchor, particle, { length: 0.2, mode: 'min' }));
-      const g = { side, shoulder, particle, punch: null, queued: null, target: new THREE.Vector3(), lastTarget: new THREE.Vector3(), omega: 18, maxAcc: 120 };
-      particle.glove = g;
+      const shoulder = new Anchor(world, null);
+      const g = { side, shoulder, punch: null, queued: null, target: new THREE.Vector3(), lastTarget: new THREE.Vector3(), omega: 18, maxAcc: 120 };
+      const info = { kind: 'glove', glove: g, owner: this, striker: true, mass: 3, region: 'guard' };
+      const body = ball(3, info);
+      world.createImpulseJoint(RAPIER.JointData.rope(ARM, { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }), shoulder.body, body, true);
+      g.particle = new BodyPoint(body, 3, 0.09, side < 0 ? 'gloveL' : 'gloveR');
+      g.particle.isPlayerGlove = true;
+      g.particle.glove = g;
       return g;
     });
-    world.addConstraint(new DistanceConstraint(this.gloves[0].particle, this.gloves[1].particle, { length: 0.2, mode: 'min' }));
     // The kicking leg: a heavy foot driven like a glove, on a rope-length leg from the hip.
-    const hip = world.addParticle(new Particle(new THREE.Vector3(), { mass: 0, name: 'playerHip' }));
-    const foot = world.addParticle(new Particle(new THREE.Vector3(), { mass: 6, radius: 0.09, gravityScale: 0, friction: 0.3, damping: 0.004, name: 'playerFoot' }));
-    world.addConstraint(new DistanceConstraint(hip, foot, { length: LEG, mode: 'max' }));
-    this.leg = { side: 1, shoulder: hip, particle: foot, punch: null, queued: null, target: new THREE.Vector3(), lastTarget: new THREE.Vector3(), omega: 18, maxAcc: 200, isLeg: true };
-    foot.glove = this.leg;
+    const hip = new Anchor(world, null);
+    this.leg = { side: 1, shoulder: hip, punch: null, queued: null, target: new THREE.Vector3(), lastTarget: new THREE.Vector3(), omega: 18, maxAcc: 200, isLeg: true };
+    const footBody = ball(6, { kind: 'glove', glove: this.leg, owner: this, striker: true, mass: 6, region: 'low' });
+    world.createImpulseJoint(RAPIER.JointData.rope(LEG, { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }), hip.body, footBody, true);
+    this.leg.particle = new BodyPoint(footBody, 6, 0.09, 'playerFoot');
+    this.leg.particle.glove = this.leg;
+    phys.afterStep.push(() => this.afterStep());
     // Your body: the same active ragdoll as your opponent's, steered by your inputs.
     this.wishVel = new THREE.Vector3();
     this.dashVel = new THREE.Vector3();
     this.lastH = 1 / 240;
-    this.body = new Opponent(world, scene, { pilot: this, colors: { skin: 0xd9a27c, shorts: 0x1840c0, trim: 0xf4f1ea, hair: 0x2a1a10, mouthguard: 0xe02828 } });
+    this.body = new Opponent(phys, scene, { pilot: this, index: 0, colors: { skin: 0xd9a27c, shorts: 0x1840c0, trim: 0xf4f1ea, hair: 0x2a1a10, mouthguard: 0xe02828, glove: 0x2a66e0 } });
     this.view = new GloveView(scene, this);
     this.legView = new LegView(scene, this);
     this.avatar = new PlayerAvatar(this);
@@ -103,7 +156,8 @@ export class Player {
     this.cons = 100; this.balance = 100; this.lastHitT = -10;
     for (const g of [...this.gloves, this.leg]) { g.punch = null; g.queued = null; }
     this.preStep(1 / 240);
-    for (const g of [...this.gloves, this.leg]) { g.particle.teleport(g.target); g.particle.force.set(0, 0, 0); g.lastTarget.copy(g.target); }
+    for (const g of [...this.gloves, this.leg]) { g.shoulder.teleport(g.shoulder.pos); g.particle.teleport(g.target); g.lastTarget.copy(g.target); }
+    this.headAnchor.teleport(this.headCenter);
     this.body.reset(x, z, yaw + Math.PI);   // again, now that the gloves are where the hands should be
   }
 
@@ -167,8 +221,9 @@ export class Player {
   }
 
   /** Swept off your feet: down for a moment, then straight back up (no count). */
-  trip() {
-    if (this.mode !== 'fight' || this.clock - (this.roseAt ?? -9) < 1) return;   // not again the moment you're back up
+  /** force: your body really has gone over (not just lost balance), so down you go regardless. */
+  trip(force = false) {
+    if (this.mode !== 'fight' || (!force && this.clock - (this.roseAt ?? -9) < 1)) return;   // not again the moment you're back up
     this.mode = 'tripped';
     this.tripT = 0;
     this.balance = 70;
@@ -317,7 +372,9 @@ export class Player {
       this.headBase.lerp(_a, fallE);
     }
     this.headPos.copy(this.headBase).add(this.headOff);
-    this.headAnchor.moveKinematic(this.headBase);
+    // your head's hitbox: where your skull is, a little behind your eyes
+    this.headCenter.set(this.headPos.x + Math.sin(this.yaw) * HEAD_BACK, this.headPos.y, this.headPos.z + Math.cos(this.yaw) * HEAD_BACK);
+    this.headAnchor.moveKinematic(this.headCenter);
     this.armBase.set(this.headBase.x - dxw * 0.65, this.headBase.y - this.dodgeOff.y * 0.5, this.headBase.z - dzw * 0.65);
     this.chestPos.set(this.pos.x + (fwx * this.lunge + dxw) * 0.5, height - 0.42, this.pos.z + (fwz * this.lunge + dzw) * 0.5);
     this.headVel.copy(this.vel).add(this.headOffVel);
@@ -461,13 +518,31 @@ export class Player {
     _v.subVectors(g.target, g.lastTarget).multiplyScalar(1 / h);
     const tv = _v.length();
     if (tv > 6) _v.multiplyScalar(6 / tv);
-    _f.subVectors(p.pos, p.prev).multiplyScalar(1 / h);
+    p.getVelocity(h, _f);
     _f.subVectors(_v, _f).multiplyScalar(2 * 0.85 * g.omega);
     _f.addScaledVector(_a.subVectors(g.target, p.pos), g.omega * g.omega);
     const acc = _f.length();
     if (acc > g.maxAcc) _f.multiplyScalar(g.maxAcc / acc);
-    p.force.addScaledVector(_f, p.mass);
+    _f.multiplyScalar(p.mass * h);
+    p.body.applyImpulse({ x: _f.x, y: _f.y, z: _f.z }, true);
     g.lastTarget.copy(g.target);
+  }
+
+  /** After each physics step: refresh glove and foot positions; keep your gloves off your face. */
+  afterStep() {
+    for (const g of [...this.gloves, this.leg]) g.particle.sync();
+    for (const g of this.gloves) {
+      const p = g.particle;
+      _v.subVectors(p.pos, this.headBase);
+      const d = _v.length();
+      if (d < 0.2 && d > 1e-6) {
+        _v.multiplyScalar((0.2 - d) / d);
+        p.pos.add(_v);
+        p.body.setTranslation({ x: p.pos.x, y: p.pos.y, z: p.pos.z }, true);
+        const lv = p.body.linvel(), n = _v.normalize(), vn = lv.x * n.x + lv.y * n.y + lv.z * n.z;
+        if (vn < 0) p.body.setLinvel({ x: lv.x - n.x * vn, y: lv.y - n.y * vn, z: lv.z - n.z * vn }, true);
+      }
+    }
   }
 
   /** impulse: N·s delivered to your head/body by the opponent's glove. */
@@ -483,7 +558,7 @@ export class Player {
     this.rotVel.z += -lateral * 0.05;
     this.rotVel.y += -lateral * 0.04;
     this.rotVel.x += impulse.y * 0.04 - forward * 0.02;
-    if (!physical) this.body.react(impulse, region, this.lastH);   // a head shot rocks your real body too
+    if (!physical) this.body.react(impulse, region);   // a head shot rocks your real body too
     this.health = Math.max(0, this.health - dmg);
   }
 
@@ -526,7 +601,8 @@ class GloveView {
     this.player = player;
     this.items = player.gloves.map((g) => {
       // 4 oz open-finger MMA gloves (thumb on the inside: local -x for your left glove)
-      const { group } = makeGlove(g.side, { glove: 0x16161a, strap: 0xc0141c, skin: 0xd9a27c }, 0.0025);   // thin outline: it's right in front of you
+      const { group } = makeGlove(g.side, { glove: 0x2a66e0, strap: 0x1e1e24, band: 0xf6f2ea, skin: 0xd9a27c }, 0.0025);   // thin outline: it's right in front of you
+      group.scale.setScalar(0.85);   // (the puffy gloves would fill the screen this close to your eyes)
       scene.add(group);
       // the arm, shoulder to wrist, as one skinned piece
       const arm = new SkinnedBody(scene, armTemplate(), { skin: 0xd9a27c, shorts: 0xd9a27c, trim: 0xd9a27c, hair: 0xd9a27c }, { outline: 0.003 });

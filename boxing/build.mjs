@@ -1,4 +1,4 @@
-// Bundles the whole game (code, Three.js, PeerJS) into one self-contained dist/index.html
+// Bundles the whole game (code, Three.js, Rapier, PeerJS) into one self-contained dist/index.html
 // that works on any static host: itch.io, Netlify, GitHub Pages, Cloudflare Pages, your own server.
 //   npm install
 //   npm run build
@@ -12,7 +12,7 @@ const result = await build({
   minify: true,
   charset: 'ascii',
   legalComments: 'eof',   // keeps the Three.js / PeerJS license notices
-  target: 'es2020',
+  target: 'es2022',   // (top-level await: Rapier's WASM is initialised before the game starts)
   write: false,
 });
 const js = result.outputFiles[0].text.replaceAll('</script', '<\\/script');

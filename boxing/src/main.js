@@ -1,9 +1,10 @@
 // Knockout Physics — game loop, rules and HUD.
 
 import * as THREE from 'three';
-import { World, collideParticles, collideParticleSphere, collideParticleCapsule } from './physics.js';
+import { PhysicsWorld } from './sim.js';
 import { Opponent, PUNCH_LABEL } from './fighter.js';
 import { Player } from './player.js';
+import { Referee } from './referee.js';
 import { Arena } from './arena.js';
 import { Sfx } from './audio.js';
 import { PhysicsDebugView } from './debug.js';
@@ -34,11 +35,14 @@ scene.background = new THREE.Color(0x07080c);
 scene.fog = new THREE.Fog(0x07080c, 14, 32);
 const camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.03, 100);
 
-const world = new World({ iterations: 10 });   // more solver passes: stiffer joints, less stretch
+const world = new PhysicsWorld();   // Rapier: rigid bodies, joints with motors, the cage
 const arena = new Arena(scene, world);
 const player = new Player(world, scene);
-const opp = new Opponent(world, scene);
+const opp = new Opponent(world, scene, { index: 1 });
+const referee = new Referee(world, scene);
+const refCtx = { a: player.pos, b: opp.base, down: null, counting: false, time: 0 };
 const debugView = new PhysicsDebugView(scene, world);
+debugView.fighters = [opp];   // V also shows his hitboxes
 const sfx = new Sfx();
 
 const game = {
@@ -57,89 +61,139 @@ function newStats() {
 game.stats = newStats();
 
 // ---------------------------------------------------------------- contacts
-const impulse = new THREE.Vector3();
-const BODY_PARTS = ['head', 'neck', 'chest', 'belly', 'pelvis', 'shoulderL', 'shoulderR', 'hipL', 'hipR', 'kneeL', 'kneeR'];
-// his feet can block your strikes too, but only the foot he's kicking with counts as an attack
-opp.p.footL.kicker = opp.kickSlot; opp.p.footR.kicker = opp.kickSlot;
+// Everything is solid in the physics world (Rapier): his body parts, your gloves, kicking foot
+// and head, your body, the cage. After each step it reports which strikers (gloves, fists,
+// feet) touched what, how fast they met and how hard; the rules below turn that into damage.
+// Hitboxes are the colliders themselves (see ragdoll.js): his are capsules sized to his body
+// (the head one runs from the jaw to the back of the skull); yours are a ball where your skull
+// is (moving with your eyes, so a slip or duck counts the moment you make it) and your real
+// body's torso and legs.
 const attackOf = (p) => p.hand?.punch || (p.kicker?.punch && p.kicker.punch.foot === p.name ? p.kicker.punch : null);
+const impulse = new THREE.Vector3();
+const hit = { point: new THREE.Vector3(), normal: new THREE.Vector3(), info: null };   // the contact being handled
 
-// Hitboxes. His: every body particle plus capsules along his limbs and torso (opp.hurt),
-// guard first. Yours: a head sphere exactly where your eyes are (so a slip or duck counts
-// the moment you make it) and your real ragdoll torso and legs for everything else.
-const HEAD_R = 0.125;
-const myHurt = player.body.hurt.filter((it) => it.region === 'body' || it.region === 'low');
-const hitTest = (p, it, h, e) => it.a ? collideParticleCapsule(p, it.a, it.b, it.r, h, e, impulse) : collideParticles(p, it, h, e, impulse);
-
-/** One of his strikes (hand or kicking foot) against you. */
-function strikePlayer(p, slot, h, headOnly = false) {
-  const s = collideParticleSphere(p, player.headPos, HEAD_R, player.headVel, 1 / 5, h, 0.1, impulse);
-  if (s >= 0) { onPlayerStruck(slot, s, impulse, 'head'); return; }
-  if (headOnly) return;
-  for (const it of myHurt) {
-    const t = hitTest(p, it, h, 0.1);
-    if (t >= 0) { onPlayerStruck(slot, t, impulse, it.region === 'low' ? 'legs' : 'body', true); return; }
+/** Contacts that shouldn't happen this step (they pass through each other). */
+world.filter = (A, B) => {
+  if (!A || !B) return true;
+  const gl = A.kind === 'glove' ? A : B.kind === 'glove' ? B : null;
+  const other = gl === A ? B : A;
+  if (gl && other.kind === 'body' && other.owner === opp) {
+    const g = gl.glove, type = g.punch?.type;
+    // body hooks and kicks go around his arms unless he has dropped his guard to cover the body
+    if ((type === 'bodyhook' || type === 'kick') && g.punch.phase !== 'ret' && !opp.coverLow && other.region === 'guard') return false;
+    // resting gloves don't parry for you: his strikes only meet your gloves when you hold guard or are punching
+    if (!g.isLeg && !player.guarding && !g.punch && (other.hand || attackOf(other))) return false;
   }
-}
-
-world.collisionHook = (h, iter) => {
-  const leg = player.leg;
-  const limbs = leg.punch && leg.punch.phase !== 'ret' ? [...player.gloves, leg] : player.gloves;
-  for (const g of limbs) {
-    const type = g.punch?.type;
-    // Body hooks and kicks go around his arms unless he has dropped his guard to cover the body.
-    const aroundArms = (type === 'bodyhook' || type === 'kick') && g.punch.phase !== 'ret' && !opp.coverLow;
-    // Resting gloves don't parry for you: his strikes only meet your gloves when you hold guard or are punching.
-    const gloveActive = player.guarding || !!g.punch;
-    if (g.isLeg && g.punch?.done) continue;   // a kick that landed carries on through: it doesn't keep shoving
-    for (const it of opp.hurt) {
-      if (aroundArms && it.region === 'guard') continue;
-      if ((it.hand || attackOf(it)) && !gloveActive) continue;
-      const s = it.a ? collideParticleCapsule(g.particle, it.a, it.b, it.r, h, 0.15) : collideParticles(g.particle, it, h, 0.15);
-      if (s >= 0) onGloveContact(g, it, s);
-    }
-  }
-  if (game.phase !== 'menu') {
-    for (const hand of opp.handList) strikePlayer(opp.p[hand.name], hand, h);
-    // his kicks: mostly at your legs (jump over them), sometimes your body or head
-    const k = opp.kickSlot.punch;
-    if (k && !k.hit) strikePlayer(opp.p[k.foot], opp.kickSlot, h, player.mode === 'down');
-  }
-  if (iter === 0) {
-    bodyContact(h);
-    if (arena.collideCage(opp.list, player) > 0.05 && opp.mode !== 'fight') arena.excitement += 0.02;
-    arena.collideCage(player.body.list, player);
-  }
+  return true;
 };
 
-/** The two bodies are solid to each other: heads, chests, hips and legs bump and shove for real. */
-const CONTACT_PARTS = [...BODY_PARTS, 'head'];
-const UPPER = ['head', 'neck', 'chest', 'shoulderL', 'shoulderR'];
+const RANK = { block: 0, head: 1, body: 2, legs: 3 };
+const pending = [];
+/** Sort this step's contacts (a guard in the way wins over the head behind it), then apply them. */
+function onContact(r) {
+  const { a, b } = r;
+  const flip = (x) => x === b;
+  // your glove or kicking foot against him (his guard, his body, or his strike: a block)
+  const gl = a.kind === 'glove' ? a : b.kind === 'glove' ? b : null;
+  if (gl) {
+    const o = gl === a ? b : a;
+    if (o.kind === 'body' && o.owner === opp) pending.push({ rank: attackOf(o) ? 0 : 1, fn: () => { setHit(r, o, flip(o)); onGloveContact(gl.glove, o, r.speed); } });
+    else if (o.kind === 'body' && o.owner === referee) pending.push({ rank: 2, fn: () => { setHit(r, o, flip(o)); onRefereeStruck(gl.glove, o, r.speed, true); } });
+    return;
+  }
+  // his fist or kicking foot against you
+  const st = a.striker && a.owner === opp ? a : b.striker && b.owner === opp ? b : null;
+  if (!st) return;
+  const o = st === a ? b : a;
+  const slot = st.fist ? st.hand : opp.kickSlot.punch && opp.kickSlot.punch.foot === st.name ? opp.kickSlot : null;
+  if (!slot) return;
+  impulse.copy(r.normal).multiplyScalar(r.impulse * (st === a ? 1 : -1));
+  if (o.kind === 'phead') pending.push({ rank: 1, fn: () => { setHit(r, o, flip(o)); onPlayerStruck(slot, r.speed, impulse.clone(), 'head'); } });
+  else if (o.kind === 'body' && o.owner === player.body) {
+    const region = o.part.startsWith('thigh') || o.part.startsWith('shin') || o.part.startsWith('foot') ? 'legs' : 'body';
+    pending.push({ rank: RANK[region], fn: () => { setHit(r, o, flip(o)); onPlayerStruck(slot, r.speed, impulse.clone(), region, true); } });
+  } else if (o.kind === 'body' && o.owner === referee) pending.push({ rank: 2, fn: () => { setHit(r, o, flip(o)); onRefereeStruck(slot, o, r.speed, false); } });
+}
+function setHit(r, info, isB) {
+  hit.point.copy(r.point);
+  hit.normal.copy(r.normal).multiplyScalar(isB ? 1 : -1);   // pointing into the one that was hit
+  hit.info = info;
+}
+function flushContacts() {
+  if (!pending.length) return;
+  pending.sort((x, y) => x.rank - y.rank);
+  for (const c of pending) c.fn();
+  pending.length = 0;
+}
+
+/** A clean shot also rocks the body part it lands on (on top of the glove's own momentum). */
+function rock(target, dmg) {
+  if (!hit.info || !target.rig) return;
+  target.rig.hit(hit.info.part, impulse.copy(hit.normal).multiplyScalar(Math.min(30, 4 + dmg * 1.1)), hit.point);
+}
+
+// Your eyes never go inside him: if your head would, your body is eased back (once per step).
 const EYE_R = 0.17;
 const STANDING = (m) => m === 'fight' || m === 'idle';
-function bodyContact(h) {
-  // a fighter who's down, swept or getting up doesn't shove the other one about
-  // (a knocked-out body collapsing into you shouldn't knock you over, nor stop you standing up)
-  if (!STANDING(player.mode) || !STANDING(opp.mode) || !STANDING(player.body.mode)) return;
-  const mine = player.body.p;
-  for (const a of CONTACT_PARTS) {
-    const p = opp.p[a];
-    for (const b of CONTACT_PARTS) collideParticles(p, mine[b], h, 0.1);
-  }
-  // Your eyes never go inside him: if your head would, both of you are eased apart
-  // (your whole body moves back, his upper body gives a little).
-  if (player.mode === 'down' || opp.mode === 'down') return;
+const _push = new THREE.Vector3();
+function keepEyesOut() {
+  if (!STANDING(player.mode) || !STANDING(opp.mode)) return;
   const e = player.headPos;
-  for (const n of UPPER) {
+  for (const n of ['head', 'neck', 'chest', 'shoulderL', 'shoulderR']) {
     const q = opp.p[n];
     const dx = e.x - q.pos.x, dy = e.y - q.pos.y, dz = e.z - q.pos.z;
     const d = Math.hypot(dx, dy, dz), minD = EYE_R + q.radius;
     if (d >= minD) continue;
-    const hd = Math.hypot(dx, dz) || 1e-6, pen = minD - d;
-    const nx = dx / hd, nz = dz / hd;
-    for (const m of player.body.list) { m.pos.x += nx * pen * 0.7; m.pos.z += nz * pen * 0.7; m.prev.x += nx * pen * 0.7; m.prev.z += nz * pen * 0.7; }
-    player.pos.x += nx * pen * 0.7; player.pos.z += nz * pen * 0.7;
-    q.pos.x -= nx * pen * 0.3; q.pos.z -= nz * pen * 0.3;
+    const hd = Math.hypot(dx, dz) || 1e-6, pen = (minD - d) * 0.7;
+    _push.set((dx / hd) * pen, 0, (dz / hd) * pen);
+    player.body.rig.shift(_push);
+    player.pos.add(_push);
   }
+}
+
+// ---------------------------------------------------------------- the referee
+/** A strike (yours or his) landed on the referee. src: your glove / his hand or kick slot. */
+function onRefereeStruck(src, info, speed, byPlayer) {
+  if (referee.mode === 'down' || game.phase !== 'fight' || mp.on) return;
+  const pu = src.punch;
+  if (!pu || pu.refHit || speed < 1.5 || pu.phase === 'wind' || (byPlayer ? pu.done : pu.hit)) return;
+  pu.refHit = true;
+  if (byPlayer) pu.done = true; else pu.hit = true;   // it was spent on him
+  const kick = byPlayer ? pu.type === 'kick' : pu.def.kind === 'kick';
+  const power = byPlayer ? pu.power : opp.diff.power * pu.def.power;
+  const v = Math.max(0, speed - 2.0) * power;
+  const region = info.region === 'head' ? 'head' : 'body';
+  const dmg = v * 2.3 * (region === 'head' ? 1 : 0.6) * (kick ? 1.3 : 1);
+  referee.takeHit(dmg, region, { cons: region === 'head' ? dmg * 1.9 : dmg * 0.4, bal: kick ? v * 5 : 0 });
+  rock(referee, dmg);
+  sfx.punch(Math.min(1.4, speed / 9), region);
+  const energy = 0.5 * (byPlayer ? (kick ? 6 : 3) : 3) * speed * speed;
+  showImpact(byPlayer ? 'YOU HIT THE REF!' : 'HE HIT THE REF!', speed, energy);
+  arena.excitement += 0.5;
+  if (byPlayer) logEvent('hit', 'REF SHOT', { dmg, speed, energy });
+  if (referee.health <= 0 || referee.cons <= 0) refereeKnockout(byPlayer, { speed, energy });
+}
+
+/** The referee is out cold: both fighters go down with him. No winner. */
+function refereeKnockout(byPlayer, info) {
+  referee.knockDown();
+  for (const h of [...opp.handList, opp.kickSlot]) h.punch = null;
+  player.knockDown();
+  opp.knockDown();
+  game.downWho = 'ref';
+  game.phase = 'kowait';
+  game.count = 0; game.countT = 0;
+  game.slowmo = 0.6;
+  ko.hitTime = game.time;
+  ko.info = { name: byPlayer ? 'YOUR SHOT ON THE REF' : 'HIS SHOT ON THE REF', ...info };
+  sfx.crowdCheer(1.6);
+  arena.excitement = 2.5;
+  banner('REFEREE DOWN!');
+}
+
+/** One of his kicks met something: it stops there and he pulls it back (no swinging on through). */
+function endKick(k) {
+  if (k.def.kind === 'kick' && k.phase === 'ext') k.t = Math.max(k.t, k.wind + k.def.ext);
 }
 
 function onGloveContact(g, p, speed) {
@@ -163,6 +217,7 @@ function onGloveContact(g, p, speed) {
     sfx.block(speed / 8);
     const broken = player.stamina <= 0;
     if (!broken) hp.hit = true;   // guard held: no clean shot; broken guard: the strike can still reach your head
+    if (kick && !hp.mirror) endKick(hp);
     publishHit(hp, chip, 2, Math.max(speed, hp.speed || 0), 0, false);
     showImpact(broken ? 'GUARD BROKEN' : guarded ? 'BLOCKED' : 'PARRIED', `−${drain.toFixed(0)} stamina${chip ? ` · −${chip.toFixed(1)} health` : ''}`);
     if (guarded) { logEvent('block', 'BLOCK'); if (!mp.on) opp.noteHabit('block'); }
@@ -172,6 +227,8 @@ function onGloveContact(g, p, speed) {
   const pu = g.punch;
   if (!pu || pu.done || pu.phase === 'wind' || speed < 1.5) return;
   pu.done = true;
+  // a kick stops where it lands and is pulled back, instead of swinging on through his body
+  if (g.isLeg) pu.t = Math.max(pu.t, pu.def.wind + pu.def.ext);
   const mass = g.particle.mass;
   const mu = (mass * p.mass) / (mass + p.mass);
   const energy = 0.5 * mu * speed * speed;
@@ -210,6 +267,7 @@ function onGloveContact(g, p, speed) {
   game.stats.topSpeed = Math.max(game.stats.topSpeed, speed);
   game.stats.topEnergy = Math.max(game.stats.topEnergy, energy);
   opp.takeHit(dmg, p.region, { cons, bal });
+  rock(opp, dmg);
   if (dmg > 6) game.hitStop = Math.min(0.08, dmg * 0.004);   // a heavy shot freezes the moment
   sfx.punch(Math.min(1.5, speed / 9 * (isKick ? 1.3 : 1)), p.region === 'low' ? 'body' : p.region);
   arena.excitement += dmg / 20;
@@ -233,6 +291,7 @@ function onPlayerStruck(hand, speed, imp, region, physical = false) {
   if (pu && !pu.hit && travelling && speed > 1.5) {
     pu.hit = true;
     const kick = pu.def.kind === 'kick';
+    if (kick && !pu.mirror) endKick(pu);   // his foot stops on you and comes back
     const counter = mp.on ? (mp.rs?.ctr || player.gloves.some((g) => g.punch?.phase === 'ext')) : false;
     const v = Math.max(0, speed - 2.0) * opp.diff.damage * pu.def.power * (counter ? 1.25 : 1);
     dmg = v * 2.4 * (region === 'head' ? 1 : region === 'legs' ? 0.3 : 0.5);
@@ -265,6 +324,7 @@ function goFullscreen() {
 function startMatch() {
   goFullscreen();
   sfx.init();
+  referee.setActive(true);
   opp.setDifficulty(game.difficulty);
   player.reset(0, 1.45, 0);
   opp.reset(0, -1.45, 0);
@@ -287,6 +347,7 @@ function startRound() {
   game.phaseT = 0;
   player.resetKeepHealth(0, 1.45, 0);
   opp.resetKeepHealth(0, -1.45, 0);
+  if (referee.active) referee.reset(1.9, 0, -Math.PI / 2);   // at the side, facing the middle
   player.mode = 'idle';
   opp.mode = 'idle';
   banner(game.round === ROUNDS ? 'FINAL ROUND' : `ROUND ${game.round}`);
@@ -358,6 +419,10 @@ function updateKnockdown(dtReal) {
     if (game.count <= 10) $('count').textContent = game.count;
     sfx.tone?.call(sfx, { freq: 220, dur: 0.12, gain: 0.15, type: 'square' });
   }
+  if (game.downWho === 'ref') {   // the referee is out cold, and both fighters with him
+    if (game.count >= 3) finish(null, 'REFEREE KNOCKOUT', 'NO CONTEST');
+    return;
+  }
   if (game.downWho === 'opp') {
     if (opp.mode === 'down' && game.count >= game.getUpAt) {
       opp.rise(Math.max(20, 55 - opp.knockdowns * 10 + Math.random() * 15));
@@ -391,7 +456,7 @@ function decision() {
   else finish(diff > 0, 'DECISION');
 }
 
-function finish(won, method) {
+function finish(won, method, title = null) {
   if (game.phase === 'kocam') endKoCam();
   finishCombo();
   game.phase = 'over';
@@ -402,12 +467,12 @@ function finish(won, method) {
   sfx.bell(3);
   sfx.crowdCheer(1.5);
   arena.excitement = 2.5;
-  banner(won === null ? 'DRAW' : won ? 'YOU WIN!' : 'YOU LOSE');
+  banner(title || (won === null ? 'DRAW' : won ? 'YOU WIN!' : 'YOU LOSE'));
   setTimeout(() => {
     if (game.phase !== 'over') return;   // left before the results came up
     const s = game.stats;
-    $('res-title').textContent = won === null ? 'DRAW' : won ? 'VICTORY' : 'DEFEAT';
-    $('res-detail').textContent = `${won === null ? '' : won ? 'Won' : 'Lost'} by ${method.toLowerCase()} · round ${game.round}`;
+    $('res-title').textContent = title || (won === null ? 'DRAW' : won ? 'VICTORY' : 'DEFEAT');
+    $('res-detail').textContent = title ? `${method.toLowerCase()}: both fighters went down with the referee` : `${won === null ? '' : won ? 'Won' : 'Lost'} by ${method.toLowerCase()} · round ${game.round}`;
     const acc = s.thrown ? Math.round((100 * s.landed) / s.thrown) : 0;
     const rows = [
       ['Strikes landed', `${s.landed} / ${s.thrown} (${acc}%)`],
@@ -442,23 +507,25 @@ function toMenu() {
   $('menu').classList.remove('hidden');
   player.reset(0, 2.4, 0);
   opp.reset(0, 0, 0);
+  referee.setActive(true);
+  referee.reset(2.2, 0.9, -Math.PI / 2);
   setGlovesVisible(false);
 }
 
 // ---------------------------------------------------------------- replays: knockout cam & highlight reel
-// The last ~8 s of every particle is recorded (60 times a second). While you fight, your
+// The last ~8 s of every physics body is recorded (60 times a second). While you fight, your
 // actions are grouped into combos (strikes, dodges, blocks with less than 1.3 s between
 // them). Good combos are copied out as clips for the highlight reel. A knockdown replays
 // its whole combo: slow at each key moment (a duck, a slip, a block) and ultra slow on
 // the final blow.
 const KO_AFTER = 1.15;
 const REC_FRAMES = 480, REC_DT = 1 / 60;
-const NP = world.particles.length;
+const NP = world.recordSize / 3;   // (stored as 3 floats per "slot": NP * 3 = 7 floats per body)
 const NX = 11;   // extra per-frame values (see extrasInto)
 const COMBO_GAP = 1.3;
 const MAX_CLIPS = 8;
 const rec = { t: new Float64Array(REC_FRAMES), pos: new Float32Array(REC_FRAMES * NP * 3), extra: new Float32Array(REC_FRAMES * NX), head: 0, count: 0, lastT: -1 };
-const live = { pos: new Float32Array(NP * 3), prev: new Float32Array(NP * 3), extra: new Float32Array(NX) };
+const live = { state: null, extra: new Float32Array(NX) };
 const ko = { hitTime: 0, info: null, skip: false };
 const reel = { clips: [], i: 0, t: 0, mode: null, clip: null, center: new THREE.Vector3(), angle0: 0, shake: 0, next: 0, chain: [], abort: false };
 const combo = { cur: null, clips: [] };
@@ -485,7 +552,7 @@ function recordFrame() {
   const i = rec.head;
   rec.t[i] = game.time;
   const base = i * NP * 3;
-  world.particles.forEach((p, k) => { rec.pos[base + k * 3] = p.pos.x; rec.pos[base + k * 3 + 1] = p.pos.y; rec.pos[base + k * 3 + 2] = p.pos.z; });
+  world.writeState(rec.pos, base);
   extrasInto(rec.extra, i * NX);
   rec.head = (i + 1) % REC_FRAMES;
   rec.count = Math.min(REC_FRAMES, rec.count + 1);
@@ -552,10 +619,7 @@ function sampleClip(clip, time) {
   const a = f[lo], b = f[hi];
   const span = b.t - a.t;
   const u = span > 1e-6 ? THREE.MathUtils.clamp((time - a.t) / span, 0, 1) : 0;
-  world.particles.forEach((p, k) => {
-    const j = k * 3;
-    p.pos.set(a.pos[j] + (b.pos[j] - a.pos[j]) * u, a.pos[j + 1] + (b.pos[j + 1] - a.pos[j + 1]) * u, a.pos[j + 2] + (b.pos[j + 2] - a.pos[j + 2]) * u);
-  });
+  world.readState(a.pos, 0, b.pos, u);
   extrasFrom(u < 0.5 ? a.extra : b.extra, 0);
 }
 
@@ -572,17 +636,16 @@ function rateAt(clip, t) {
 
 function playClips(clips, mode) {
   if (!clips.length) return false;
-  world.particles.forEach((p, k) => {
-    live.pos[k * 3] = p.pos.x; live.pos[k * 3 + 1] = p.pos.y; live.pos[k * 3 + 2] = p.pos.z;
-    live.prev[k * 3] = p.prev.x; live.prev[k * 3 + 1] = p.prev.y; live.prev[k * 3 + 2] = p.prev.z;
-  });
+  live.state = world.saveLive();
   extrasInto(live.extra, 0);
   live.legPunch = player.leg.punch; player.leg.punch = null;
   Object.assign(reel, { clips, mode, abort: false });
   ko.skip = false;
   game.phase = mode === 'ko' ? 'kocam' : 'reel';
   player.avatar.group.visible = true;
-  for (const it of player.view.items) it.arm.visible = false;   // the avatar has its own arms
+  // the replay shows your body, whose fists are drawn on your gloves: hide the first-person ones
+  live.gloves = player.view.items.map((it) => it.group.visible);
+  for (const it of player.view.items) it.arm.visible = it.group.visible = false;
   $('hud').classList.add('hidden');
   $('kocam').classList.remove('hidden');
   $('kc-title-text').textContent = mode === 'ko' ? 'KNOCKOUT CAM' : 'HIGHLIGHTS';
@@ -597,7 +660,11 @@ function startClip(i) {
   sampleClip(c, key);
   const dx = opp.p.head.pos.x - player.pos.x, dz = opp.p.head.pos.z - player.pos.z;
   reel.center.set(player.pos.x + dx * 0.55, 0, player.pos.z + dz * 0.55);
-  reel.angle0 = Math.atan2(dz, dx) + (Math.random() < 0.5 ? 1 : -1) * (Math.PI / 2 - 0.35);
+  // film from the side the referee isn't standing on (he'd be in the shot)
+  const rp = referee.p.pelvis.pos;
+  const side = (s) => { const a = Math.atan2(dz, dx) + s * (Math.PI / 2 - 0.35) + 0.35; return Math.hypot(reel.center.x + Math.cos(a) * 2.4 - rp.x, reel.center.z + Math.sin(a) * 2.4 - rp.z); };
+  const s = side(1) > side(-1) ? 1 : -1;
+  reel.angle0 = Math.atan2(dz, dx) + s * (Math.PI / 2 - 0.35);
   $('kc-sub').textContent = reel.mode === 'reel' ? `${i + 1} / ${reel.clips.length}${c.ko ? ' · KNOCKOUT' : ''}` : '';
   $('kc-caption').textContent = '';
   $('kc-caption').classList.remove('show');
@@ -630,6 +697,7 @@ function updateReel(dtReal) {
 
   _bodyQ.quaternion.setFromEuler(new THREE.Euler(0, player.yaw + player.twist, 0, 'YXZ'));
   opp.view.update();
+  referee.view.update();
   player.view.update(_bodyQ);
   player.legView.update(_bodyQ);
   player.avatar.update();
@@ -642,14 +710,11 @@ function updateReel(dtReal) {
 }
 
 function endReel() {
-  world.particles.forEach((p, k) => {
-    p.pos.set(live.pos[k * 3], live.pos[k * 3 + 1], live.pos[k * 3 + 2]);
-    p.prev.set(live.prev[k * 3], live.prev[k * 3 + 1], live.prev[k * 3 + 2]);
-  });
+  world.restoreLive(live.state);
   extrasFrom(live.extra, 0);
   player.leg.punch = live.legPunch || null;
   player.avatar.group.visible = false;
-  for (const it of player.view.items) it.arm.visible = it.group.visible;
+  player.view.items.forEach((it, i) => { it.arm.visible = it.group.visible = live.gloves ? live.gloves[i] : true; });
   $('kocam').classList.add('hidden');
   const mode = reel.mode;
   reel.mode = null;
@@ -977,6 +1042,7 @@ function beginOnlineMatch() {
   combo.cur = null; combo.clips = [];
   opp.remote = remoteBody;
   opp.diff = MP_DIFF;
+  referee.setActive(false);   // (online matches have no referee yet: each side would see its own)
   mp.lastConfirm = Math.max(0, ...(mp.rs?.hit || []).map(hitSeqOf));   // ignore reports from before this match
   const [x, z, yaw] = myCorner(), [ox, oz, oyaw] = theirCorner();
   player.reset(x, z, yaw);
@@ -1240,7 +1306,7 @@ function updateHud(dt) {
   $('vignette').style.opacity = Math.max(game.vignette, lowHealth);
   if (debugView.visible) {
     $('debug-info').textContent =
-      `${world.particles.length} particles · ${world.constraints.length} constraints · ${Math.round(1 / STEP)} Hz × ${world.iterations} iters\n` +
+      `${world.world.bodies.len()} bodies · ${world.world.impulseJoints.len()} joints · ${Math.round(1 / STEP)} Hz × ${world.world.numSolverIterations} iters\n` +
       `opp tone ${opp.tone.toFixed(2)} · daze ${opp.daze.toFixed(2)} · ${opp.tactic}`;
   } else $('debug-info').textContent = '';
 }
@@ -1450,7 +1516,10 @@ function updatePhase(dt, dtReal) {
 function substep(h) {
   player.preStep(h);
   opp.preStep(h, ctx);
-  world.step(h);
+  if (referee.active) referee.preStep(h);
+  world.step(h, onContact);
+  flushContacts();
+  keepEyesOut();
 }
 
 toMenu();
@@ -1478,6 +1547,10 @@ renderer.setAnimationLoop((now) => {
 
   updatePhase(dt, dtReal);
   opp.think(dt, ctx);
+  refCtx.time = game.time;
+  refCtx.down = game.downWho === 'opp' && opp.mode === 'down' ? opp.p.pelvis.pos : game.downWho === 'player' && player.mode === 'down' ? player.body.p.pelvis.pos : null;
+  refCtx.counting = !!refCtx.down && game.phase === 'knockdown';
+  if (referee.active) referee.think(dt, refCtx);
 
   acc += dt;
   let n = 0;
@@ -1490,6 +1563,7 @@ renderer.setAnimationLoop((now) => {
   if (combo.cur && game.phase !== 'kowait' && game.time - combo.cur.last > COMBO_GAP) finishCombo();
   arena.updateCrowd(dtReal);
   opp.view.update();
+  referee.view.update();
   debugView.update();
 
   if (game.phase === 'menu') {
@@ -1509,4 +1583,4 @@ renderer.setAnimationLoop((now) => {
 });
 
 // handy for tinkering from the console
-window.game = { camera, game, player, opp, world, arena, startMatch, oppKnockdown, mp, net, combo, reel, rateAt, watchHighlights, finishCombo, recordFrame, startKoCam, updateReel, finish };
+window.game = { renderer, scene, debugView, referee, refCtx, ctx, substep, camera, game, player, opp, world, arena, startMatch, oppKnockdown, mp, net, combo, reel, rateAt, watchHighlights, finishCombo, recordFrame, startKoCam, updateReel, finish };
