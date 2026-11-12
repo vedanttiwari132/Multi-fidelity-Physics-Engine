@@ -111,12 +111,34 @@ world.collisionHook = (h, iter) => {
   }
 };
 
-/** The two bodies are solid to each other: chests, hips and legs bump and shove for real. */
+/** The two bodies are solid to each other: heads, chests, hips and legs bump and shove for real. */
+const CONTACT_PARTS = [...BODY_PARTS, 'head'];
+const UPPER = ['head', 'neck', 'chest', 'shoulderL', 'shoulderR'];
+const EYE_R = 0.17;
+const STANDING = (m) => m === 'fight' || m === 'idle';
 function bodyContact(h) {
+  // a fighter who's down, swept or getting up doesn't shove the other one about
+  // (a knocked-out body collapsing into you shouldn't knock you over, nor stop you standing up)
+  if (!STANDING(player.mode) || !STANDING(opp.mode) || !STANDING(player.body.mode)) return;
   const mine = player.body.p;
-  for (const a of BODY_PARTS) {
+  for (const a of CONTACT_PARTS) {
     const p = opp.p[a];
-    for (const b of BODY_PARTS) collideParticles(p, mine[b], h, 0.1);
+    for (const b of CONTACT_PARTS) collideParticles(p, mine[b], h, 0.1);
+  }
+  // Your eyes never go inside him: if your head would, both of you are eased apart
+  // (your whole body moves back, his upper body gives a little).
+  if (player.mode === 'down' || opp.mode === 'down') return;
+  const e = player.headPos;
+  for (const n of UPPER) {
+    const q = opp.p[n];
+    const dx = e.x - q.pos.x, dy = e.y - q.pos.y, dz = e.z - q.pos.z;
+    const d = Math.hypot(dx, dy, dz), minD = EYE_R + q.radius;
+    if (d >= minD) continue;
+    const hd = Math.hypot(dx, dz) || 1e-6, pen = minD - d;
+    const nx = dx / hd, nz = dz / hd;
+    for (const m of player.body.list) { m.pos.x += nx * pen * 0.7; m.pos.z += nz * pen * 0.7; m.prev.x += nx * pen * 0.7; m.prev.z += nz * pen * 0.7; }
+    player.pos.x += nx * pen * 0.7; player.pos.z += nz * pen * 0.7;
+    q.pos.x -= nx * pen * 0.3; q.pos.z -= nz * pen * 0.3;
   }
 }
 

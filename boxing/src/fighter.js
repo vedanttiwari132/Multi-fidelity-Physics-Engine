@@ -291,7 +291,7 @@ export class Opponent {
   // ----- per physics step --------------------------------------------------
   preStep(h, ctx) {
     this.clock += h;
-    const k = 1 - Math.exp(-h * 12);
+    const k = 1 - Math.exp(-h * 20);
     const bounce = this.mode === 'fight' ? 0.012 * (1 + Math.sin(this.clock * Math.PI * 2 * 1.8)) : 0;
     this.lean += (this.leanT - this.lean) * k;
     this.slip += (this.slipT - this.slip) * k;
@@ -315,7 +315,7 @@ export class Opponent {
       if (this.pilot) this.pilot.balance = this.balance;
       let dy = this.desiredYaw - this.yaw;
       dy = Math.atan2(Math.sin(dy), Math.cos(dy));
-      const turn = this.pilot ? 12 : 6;   // you turn your body as fast as you can step it round
+      const turn = this.pilot ? 14 : 10;   // you turn your body as fast as you can step it round
       this.yaw += Math.max(-turn * h, Math.min(turn * h, dy));
     } else {
       if (this.pilot) this.thinkPilot(h);
@@ -388,13 +388,16 @@ export class Opponent {
     // a dash is an explosive push-off and a planted stop: the feet grip harder, and you mean to be moving
     const dash = this.pilot && this.pilot.dashT > -0.35;
     if (!dash) this.balance -= this.offBalance * h * (kick ? 60 : 200);
-    if ((this.balance <= 0 || this.offBalance > (dash ? 1.2 : 0.6)) && this.mode === 'fight') { this.trip(); return; }
+    // (just back on your feet: a moment to find your balance before you can be put down by it again)
+    this.steadyT = Math.max(0, (this.steadyT || 0) - h);
+    if (this.steadyT > 0) this.balance = Math.max(this.balance, 40);
+    if ((this.balance <= 0 || this.offBalance > (dash ? 1.2 : 0.6)) && this.mode === 'fight' && this.steadyT <= 0) { this.trip(); return; }
 
     // legs push the body toward where the AI wants to go, limited by grip
     if (grounded && this.tone > 0.3) {
-      let ax = (this.desiredVel.x - vx) * 6, az = (this.desiredVel.z - vz) * 6;
+      let ax = (this.desiredVel.x - vx) * 11, az = (this.desiredVel.z - vz) * 11;
       // feet can only push (or brake) as hard as their grip allows; off balance, even less
-      const lim = 0.5 * 9.81 * (grounded === 2 ? 1 : 0.6) * this.tone * (0.4 + 0.6 * this.support) * (dash ? 4 : 1);
+      const lim = 0.85 * 9.81 * (grounded === 2 ? 1 : 0.6) * this.tone * (0.4 + 0.6 * this.support) * (dash ? (this.pilot.dashT > 0 ? 2.6 : 2.0) : 1);
       const al = Math.hypot(ax, az);
       if (al > lim) { ax *= lim / al; az *= lim / al; }
       for (const n of ['pelvis', 'belly', 'chest', 'hipL', 'hipR']) { p[n].force.x += ax * p[n].mass * M / 50; p[n].force.z += az * p[n].mass * M / 50; }
@@ -411,12 +414,12 @@ export class Opponent {
       let best = null, bestErr = 0;
       for (const n of ['footL', 'footR']) {
         this.toWorld(_l.copy(this.local[n]), _x);
-        _x.x += vx * 0.25; _x.z += vz * 0.25; _x.y = this.local[n].y;   // step to where the body is going
+        _x.x += vx * 0.2; _x.z += vz * 0.2; _x.y = this.local[n].y;   // step to where the body is going
         const err = Math.hypot(_x.x - this.plant[n].x, _x.z - this.plant[n].z);
         if (err > bestErr) { bestErr = err; best = n; this._stepTo.copy(_x); }
       }
       const urgent = this.offBalance > 0.02;
-      if (best && (bestErr > 0.17 || urgent)) {
+      if (best && (bestErr > 0.13 || urgent)) {
         if (urgent) {   // reach toward the capture point to catch the fall
           this._stepTo.x += (_w.x - cx) * 0.6; this._stepTo.z += (_w.z - cz) * 0.6;
         }
@@ -424,7 +427,7 @@ export class Opponent {
         const dx = this._stepTo.x - from.x, dz = this._stepTo.z - from.z, d = Math.hypot(dx, dz);
         if (d > 0.62) { this._stepTo.x = from.x + (dx / d) * 0.62; this._stepTo.z = from.z + (dz / d) * 0.62; }
         clampToOctagon(this._stepTo, 0.25);
-        this.stepping = { foot: best, from: from.clone(), to: this._stepTo.clone(), t: 0, dur: urgent ? 0.16 : 0.26 };
+        this.stepping = { foot: best, from: from.clone(), to: this._stepTo.clone(), t: 0, dur: urgent ? 0.13 : 0.19 };
       }
     }
   }
@@ -722,7 +725,7 @@ export class Opponent {
       this.rise(this.health, true);
     } else if (this.mode === 'rising') {
       this.tone = Math.min(1, this.tone + dt * 0.9);
-      if (this.tone >= 1 && m !== 'rising') this.mode = m;
+      if (this.tone >= 1 && m !== 'rising') { this.mode = m; this.steadyT = 1; this.offBalance = 0; }
     } else {
       this.mode = m === 'rising' ? 'fight' : m;
       this.tone = 0.45 + 0.55 * Math.pow(pl.cons / 100, 0.7);   // the lower your consciousness, the wobblier
@@ -776,7 +779,7 @@ export class Opponent {
       if (this.tripT > 1.7) this.rise(this.health, true);
     } else if (this.mode === 'rising') {
       this.tone = Math.min(1, this.tone + dt * 0.75);
-      if (this.tone >= 1) { this.mode = 'fight'; this.coverT = 1.2; this.tactic = 'retreat'; this.tacticT = 1.2; }
+      if (this.tone >= 1) { this.mode = 'fight'; this.coverT = 1.2; this.tactic = 'retreat'; this.tacticT = 1.2; this.steadyT = 1; this.offBalance = 0; }
     } else this.tone = 0.45 + 0.55 * Math.pow(this.cons / 100, 0.7);   // the lower his consciousness, the wobblier
 
     const dx = ctx.playerPos.x - this.base.x, dz = ctx.playerPos.z - this.base.z;
@@ -938,7 +941,11 @@ export class Opponent {
 
   /** Swept off his feet: down briefly, then straight back up (no count). */
   trip() {
-    if (this.pilot) { this.mode = 'tripped'; this.stepping = null; if (this.pilot.mode === 'fight') this.pilot.trip(); return; }
+    if (this.pilot) {
+      if (this.pilot.mode === 'fight') this.pilot.trip();
+      if (this.pilot.mode === 'tripped') { this.mode = 'tripped'; this.stepping = null; }
+      return;
+    }
     this.mode = 'tripped';
     this.tripT = 0;
     this.balance = 70;
@@ -950,6 +957,7 @@ export class Opponent {
 
   rise(health, fromTrip = false) {
     this.mode = 'rising';
+    this.offBalance = 0; this.support = 1; this.steadyT = 1.2;
     this.health = health;
     if (!fromTrip) this.cons = Math.max(this.cons, 60);
     this.balance = Math.max(this.balance, 80);
@@ -1021,8 +1029,16 @@ class FighterView {
       const brow = add(new THREE.BoxGeometry(1, 1, 1), dark, this.head); brow.scale.set(0.044, 0.012, 0.014);
       brow.position.set(sx * 0.047, 0.052, 0.13); brow.rotation.z = sx * -0.25;   // a scowl
     }
-    const guard = add(sphere, toonMaterial({ color: C.mouthguard }), this.head);
-    guard.scale.set(0.04, 0.012, 0.01); guard.position.set(0, -0.06, 0.136);
+    // a set mouth, sitting on the face surface (found from the body mesh), with the gumshield just showing
+    const tpl = getHumanTemplate().geometry.getAttribute('position');
+    const front = (y0) => {
+      let z = 0;
+      for (let v = 0; v < tpl.count; v++) if (Math.abs(tpl.getX(v)) < 0.012 && Math.abs(tpl.getY(v) - y0) < 0.008) z = Math.max(z, tpl.getZ(v));
+      return z - REST.head[2];
+    };
+    const my = -0.058, mz = front(REST.head[1] + my);
+    const mouth = add(new THREE.BoxGeometry(1, 1, 1), dark, this.head); mouth.scale.set(0.046, 0.013, 0.01); mouth.position.set(0, my, mz - 0.002);
+    const gum = add(new THREE.BoxGeometry(1, 1, 1), toonMaterial({ color: C.mouthguard }), this.head); gum.scale.set(0.036, 0.006, 0.01); gum.position.set(0, my + 0.001, mz);
 
     // 4 oz open-finger MMA gloves (left glove: thumb toward its right, i.e. local -x)
     this.gloves = [];

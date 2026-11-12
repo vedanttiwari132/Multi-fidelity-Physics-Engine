@@ -168,6 +168,7 @@ export class Player {
 
   /** Swept off your feet: down for a moment, then straight back up (no count). */
   trip() {
+    if (this.mode !== 'fight' || this.clock - (this.roseAt ?? -9) < 1) return;   // not again the moment you're back up
     this.mode = 'tripped';
     this.tripT = 0;
     this.balance = 70;
@@ -301,7 +302,7 @@ export class Player {
     } else if (this.mode === 'down') this.fall = Math.min(1, this.fall + h / 0.7);
     else if (this.mode === 'rising') {
       this.fall = Math.max(0, this.fall - h / 1.1);
-      if (this.fall <= 0) this.mode = 'fight';
+      if (this.fall <= 0) { this.mode = 'fight'; this.roseAt = this.clock; }
     } else this.fall = 0;
     const fallE = smooth(this.fall);
 

@@ -349,6 +349,38 @@ function rampTexture() {
 export function toonMaterial(opts = {}) {
   return new THREE.MeshToonMaterial({ gradientMap: rampTexture(), ...opts });
 }
+/**
+ * Toon material that paints skin, shorts, waistband and hair as solid colours, deciding per
+ * pixel from the rest-pose position (so the hems and hairline are clean lines, not the
+ * sawtooth you get from colouring whole triangles).
+ */
+function regionMaterial(colors, cuts) {
+  const m = toonMaterial();
+  const C = (c) => new THREE.Color(c);
+  const U = { uSkin: { value: C(colors.skin) }, uShorts: { value: C(colors.shorts) }, uTrim: { value: C(colors.trim) }, uHair: { value: C(colors.hair) },
+    uCut: { value: cuts || new THREE.Vector4(-9, 9, 9, 0) } };
+  m.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, U);
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aZone;\nvarying vec3 vRest;\nvarying float vZone;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n  vRest = position; vZone = aZone;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 uSkin, uShorts, uTrim, uHair;\nuniform vec4 uCut;\nvarying vec3 vRest;\nvarying float vZone;')
+      .replace('vec4 diffuseColor = vec4( diffuse, opacity );', `
+  vec3 col = uSkin;
+  float y = vRest.y;
+  if (vZone > 0.5 && vZone < 1.5) {
+    if (y >= uCut.x - 0.07 && y < uCut.x - 0.03) col = uTrim;
+    else if (y < uCut.x - 0.03 && y > uCut.y) col = uShorts;
+  }
+  // hair: the crown, and down the back of the head
+  if (vZone > 1.5 && ((y > uCut.z && vRest.z < uCut.w) || (y > uCut.z - 0.1 && vRest.z < uCut.w - 0.11))) col = uHair;
+  vec4 diffuseColor = vec4( col, opacity );`);
+  };
+  m.customProgramCacheKey = () => 'region';
+  return m;
+}
+
 /** Dark outline: the mesh drawn again, inside out and pushed out along its normals. */
 export function outlineMaterial(width = 0.011) {
   const m = new THREE.MeshBasicMaterial({ color: 0x14100e, side: THREE.BackSide });
@@ -375,6 +407,7 @@ export function buildHumanTemplate(restJ, { voxel = 0.015 } = {}) {
   // skinning: each vertex to its 3 nearest allowed bones, weighted by 1/d^4
   const n = mesh.pos.length / 3;
   const skinIndex = new Uint16Array(n * 4), skinWeight = new Float32Array(n * 4), region = new Uint8Array(n);
+  const zone = new Float32Array(n);   // 1 = torso/legs (shorts), 2 = head (hair): colours are cut per pixel in the shader
   const segDist = (b, x, y, z) => {
     const A = J[b.from];
     if (!b.to) return Math.hypot(x - A[0], y - A[1], z - A[2]);
@@ -398,14 +431,18 @@ export function buildHumanTemplate(restJ, { voxel = 0.015 } = {}) {
     if (gname === 'torso' && y >= J.belly[1] - 0.07 && y < J.belly[1] - 0.03) r = 2;
     if (gname === 'head' && y > J.head[1] + 0.07 && z < 0.07) r = 3;
     region[v] = r;
+    zone[v] = gname === 'torso' || gname === 'legL' || gname === 'legR' ? 1 : gname === 'head' ? 2 : 0;
   }
+  // where the colours change, in the rest pose: waist, shorts hem, hairline
+  const cuts = new THREE.Vector4(J.belly[1], J.kneeL[1] + 0.15, J.head[1] + 0.07, 0.07);
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(mesh.pos, 3));
   geometry.setAttribute('normal', new THREE.BufferAttribute(mesh.nrm, 3));
   geometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndex, 4));
   geometry.setAttribute('skinWeight', new THREE.BufferAttribute(skinWeight, 4));
   geometry.setIndex(mesh.index);
-  return { geometry, region, bones, rest, ms: performance.now() - t0, vertices: n };
+  geometry.setAttribute('aZone', new THREE.BufferAttribute(zone, 1));
+  return { geometry, region, bones, rest, cuts, ms: performance.now() - t0, vertices: n };
 }
 
 /** One skinned body in the scene (solid colours, toon shaded, outlined), posed from joint positions each frame. */
@@ -413,11 +450,7 @@ export class SkinnedBody {
   constructor(scene, template, colors, { outline = 0.009 } = {}) {
     this.t = template;
     const geo = template.geometry.clone();
-    const n = template.region.length;
-    const col = new Float32Array(n * 3);
-    const palette = [colors.skin, colors.shorts, colors.trim, colors.hair].map((c) => new THREE.Color(c));
-    for (let v = 0; v < n; v++) { const c = palette[template.region[v]]; col[v * 3] = c.r; col[v * 3 + 1] = c.g; col[v * 3 + 2] = c.b; }
-    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    if (!geo.getAttribute('aZone')) geo.setAttribute('aZone', new THREE.BufferAttribute(new Float32Array(template.region.length), 1));
     this.index = Object.fromEntries(template.bones.map((b, i) => [b.name, i]));
     this.qs = template.bones.map(() => new THREE.Quaternion());
     this.ps = template.bones.map(() => new THREE.Vector3());
@@ -425,7 +458,7 @@ export class SkinnedBody {
     const inverses = template.rest.map((r) => r.m.clone().invert());
     for (let i = 0; i < this.bones.length; i++) this.bones[i].matrixWorld.copy(template.rest[i].m);
     this.skeleton = new THREE.Skeleton(this.bones, inverses);
-    this.mesh = new THREE.SkinnedMesh(geo, toonMaterial({ vertexColors: true }));
+    this.mesh = new THREE.SkinnedMesh(geo, regionMaterial(colors, template.cuts));
     this.mesh.bind(this.skeleton, new THREE.Matrix4());
     this.mesh.castShadow = true;
     this.mesh.frustumCulled = false;
