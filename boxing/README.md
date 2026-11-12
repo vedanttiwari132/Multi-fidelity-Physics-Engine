@@ -4,7 +4,9 @@ A first-person MMA game in an octagon where the fighting is driven by physics, n
 
 - **Your gloves** are 3 kg simulated bodies pulled toward punch targets by spring-damper (PD) "muscles", with arm length enforced by a distance constraint. Damage comes from the **actual impact speed** of the collision, so range, timing, footwork (stepping in adds speed) and stamina (tired = weaker muscles) all matter.
 - **The opponent** is an *active ragdoll*: 17 Verlet particles with joint limits and self-collision. Nothing anchors him in place: muscles only shape his pose (they can't push the body as a whole), his legs push against the floor (as hard as grip allows) to move him, and his weight is only held up while he's balanced over his feet. When a hit or shove moves his balance point (the capture point) past his feet he takes real recovery steps, stumbling several if he has to, and falls if no step can catch him. Struck areas go briefly slack, so heads snap and bodies fold before recovering. Heavy hits freeze the moment for a few hundredths of a second (hit-stop).
-- **One continuous body.** Each fighter is a single smooth skinned mesh, modelled at load from blended shapes (torso, chest, glutes, tapered and muscled limbs, a head with jaw, nose and ears) and bent by a 17-bone skeleton that follows the physics. Your first-person arms are skinned the same way.
+- **One continuous cartoon body.** Each fighter is a single smooth skinned mesh, modelled at load from blended shapes (a broad cartoon torso, chunky muscled limbs, a big head with jaw, nose, ears, scowling brows and a mouthguard) and bent by a 17-bone skeleton that follows the physics. Bones only swing (they never stretch or scale), so arms keep their shape even in the knockout cam. Your first-person arms are skinned the same way.
+- **No textures on the fighters.** Everything on them is a solid colour with toon (cel) shading and an ink outline. The gloves are modelled 4 oz open-finger MMA gloves: a padded knuckle pad, a wrist cuff with a coloured strap, and bare fingers and thumb.
+- **Fight animation.** The opponent never keeps his head still (small rhythmic slips and dips), his guard hands breathe, the free hand covers his chin while the other punches or he kicks, straights and hooks are driven by a knee dip and hip twist, and his arms counterbalance his kicks.
 - **Blocking is physical.** Your gloves and his gloves are colliders, so a guard only works if the gloves are actually in the way.
 - **The ropes** are Verlet chains that he bounces off.
 - **Telegraphed attacks.** The glove he's about to throw glows, and a ring around your sights lights up on the side it's coming from, with a hint for how to avoid it. Slip or duck it and he's left open for a counter.
@@ -88,7 +90,7 @@ On the claude.ai page the game uses the artifact `room` capability instead, whic
 |---|---|
 | `src/physics.js` | Verlet engine: particles, distance constraints (equal / max / min), floor friction, sphere and segment contacts with impulses, two-bone IK |
 | `src/fighter.js` | Opponent active ragdoll (balance, stepping, muscles), AI, visuals |
-| `src/body.js` | Builds the skinned human body (distance field + surface nets + skinning) |
+| `src/body.js` | Builds the skinned cartoon body and MMA gloves (distance field + surface nets + skinning), toon shading and outlines |
 | `src/player.js` | First-person controller, PD-driven gloves, punch trajectories, head-recoil springs |
 | `src/arena.js` | Octagon cage, lights, crowd |
 | `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, rounds / knockdowns, knockout cam, online match flow, HUD, input |

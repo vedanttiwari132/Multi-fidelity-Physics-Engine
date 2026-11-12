@@ -9,7 +9,7 @@
 import * as THREE from 'three';
 import { Particle, DistanceConstraint, solveTwoBone } from './physics.js';
 import { clampToOctagon } from './arena.js';
-import { SkinnedBody, buildArmTemplate } from './body.js';
+import { SkinnedBody, buildArmTemplate, makeGlove, toonMaterial } from './body.js';
 import { getHumanTemplate } from './fighter.js';
 
 export const PUNCHES = {
@@ -504,26 +504,13 @@ const armTemplate = () => armTpl || (armTpl = buildArmTemplate());
 class GloveView {
   constructor(scene, player) {
     this.player = player;
-    // 4 oz MMA gloves: small black pad over the knuckles, open fingers, red wrist strap
-    const leather = new THREE.MeshPhysicalMaterial({ color: 0x15151a, roughness: 0.38, clearcoat: 0.7, clearcoatRoughness: 0.3 });
-    const strap = new THREE.MeshStandardMaterial({ color: 0xb3121c, roughness: 0.5 });
-    const skin = new THREE.MeshStandardMaterial({ color: 0xd9a27c, roughness: 0.6 });
-    const sphere = new THREE.SphereGeometry(1, 28, 20);
-    const cyl = new THREE.CylinderGeometry(1, 1, 1, 14);
     this.items = player.gloves.map((g) => {
-      const group = new THREE.Group();
-      const body = new THREE.Mesh(sphere, leather); body.scale.set(0.072, 0.066, 0.085);
-      const knuckle = new THREE.Mesh(sphere, leather); knuckle.scale.set(0.068, 0.052, 0.045); knuckle.position.set(0, 0.022, 0.045);
-      const fingers = new THREE.Mesh(sphere, skin); fingers.scale.set(0.062, 0.03, 0.035); fingers.position.set(0, -0.035, 0.055);
-      const thumb = new THREE.Mesh(sphere, skin); thumb.scale.set(0.025, 0.028, 0.048); thumb.position.set(-g.side * 0.055, 0.0, 0.03);
-      const cuff = new THREE.Mesh(cyl, leather); cuff.scale.set(0.044, 0.045, 0.044); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.07;
-      const band = new THREE.Mesh(cyl, strap); band.scale.set(0.046, 0.012, 0.046); band.rotation.x = Math.PI / 2; band.position.z = -0.075;   // red wrist band
-      group.add(body, knuckle, fingers, thumb, cuff, band);
-      for (const m of [body, knuckle, fingers, thumb, cuff, band]) { m.castShadow = true; m.receiveShadow = true; }
+      // 4 oz open-finger MMA gloves (thumb on the inside: local -x for your left glove)
+      const { group } = makeGlove(g.side, { glove: 0x16161a, strap: 0xc0141c, skin: 0xd9a27c }, 0.0025);   // thin outline: it's right in front of you
       scene.add(group);
       // the arm, shoulder to wrist, as one skinned piece
-      const arm = new SkinnedBody(scene, armTemplate(), { skin: 0xd9a27c, shorts: 0xd9a27c, trim: 0xd9a27c, hair: 0xd9a27c });
-      const J = { shoulder: new THREE.Vector3(), elbow: new THREE.Vector3(), hand: new THREE.Vector3(), latA: new THREE.Vector3(), latB: new THREE.Vector3() };
+      const arm = new SkinnedBody(scene, armTemplate(), { skin: 0xd9a27c, shorts: 0xd9a27c, trim: 0xd9a27c, hair: 0xd9a27c }, { outline: 0.003 });
+      const J = { shoulder: new THREE.Vector3(), elbow: new THREE.Vector3(), hand: new THREE.Vector3(), base: new THREE.Vector3(), latA: new THREE.Vector3(), latB: new THREE.Vector3() };
       return { g, group, arm, J };
     });
   }
@@ -547,6 +534,7 @@ class GloveView {
 
       const J = it.J;
       J.shoulder.copy(sp); J.elbow.copy(_el); J.hand.copy(gp).addScaledVector(_bz, -0.07);
+      J.base.copy(sp).add(_v.set(0, 0.3, 0).applyQuaternion(camera.quaternion));   // the torso's up and right
       J.latB.copy(sp); J.latA.copy(sp).add(_v.set(1, 0, 0).applyQuaternion(camera.quaternion));
       it.arm.update(J);
     }
@@ -557,8 +545,8 @@ class GloveView {
 class LegView {
   constructor(scene, player) {
     this.player = player;
-    const skin = new THREE.MeshStandardMaterial({ color: 0xd9a27c, roughness: 0.6 });
-    const shorts = new THREE.MeshStandardMaterial({ color: 0x1840c0, roughness: 0.45 });
+    const skin = toonMaterial({ color: 0xd9a27c });
+    const shorts = toonMaterial({ color: 0x1840c0 });
     const cyl = new THREE.CylinderGeometry(1, 1, 1, 12);
     this.thigh = new THREE.Mesh(cyl, shorts);
     this.shin = new THREE.Mesh(cyl, skin);

@@ -9,7 +9,7 @@
 import * as THREE from 'three';
 import { Particle, DistanceConstraint, HingeConstraint, solveTwoBone } from './physics.js';
 import { clampToOctagon, OCT_APOTHEM } from './arena.js';
-import { buildHumanTemplate, SkinnedBody } from './body.js';
+import { buildHumanTemplate, SkinnedBody, makeGlove, toonMaterial } from './body.js';
 
 export const UPPER_ARM = 0.31, FOREARM = 0.34, THIGH = 0.41, SHIN = 0.44;
 const G = 9.81;
@@ -504,6 +504,17 @@ export class Opponent {
     else _l.copy(this.local[hand.name]);
     if (this.mode !== 'fight' && this.mode !== 'idle') _l.set(sd * 0.25, 1.0, 0.1);
     _l.y -= Math.min(1, this.daze) * 0.18;
+    const fighting = this.mode === 'fight';
+    if (fighting && !hand.punch) {
+      const kick = this.kickSlot.punch;
+      const otherBusy = this.handList.some((o) => o !== hand && o.punch && o.punch.phase !== 'ret');
+      if (kick && kick.def.side === sd && kick.phase !== 'ret') { _l.set(sd * 0.33, 1.05, -0.12); hand.pole.set(sd, -0.5, -0.5); }   // counterbalance the kick
+      else if (otherBusy || kick) { _l.set(sd * 0.08, 1.53, 0.17); hand.omega = 24; hand.maxAcc = 130; }                           // cover the chin
+      else if (!this.cover && !this.coverLow) {                                                                                   // hands breathe in guard
+        _l.x += Math.sin(this.clock * 2.1 + sd) * 0.012;
+        _l.y += Math.cos(this.clock * 2.6 + sd * 1.3) * 0.014;
+      }
+    }
     _l.x += this.slip; _l.y -= this.crouch; _l.z += this.lean;
     this.toWorld(_l, out);
     if (this.cover || this.coverLow) { hand.omega = 26; hand.maxAcc = 150; }
@@ -536,13 +547,13 @@ export class Opponent {
       if (d.kind === 'straight' || d.kind === 'superman') {
         _w.subVectors(pu.aim, this.target[hand.shoulder]).normalize();
         out.copy(pu.aim).addScaledVector(_w, 0.3);
-        this.leanT = 0.12; this.twistT = sd * 0.07;
+        this.leanT = 0.12; this.twistT = sd * 0.09; this.crouchT = 0.04;   // drive from the legs and hips
       } else if (d.kind === 'hook') {
         _w.copy(pu.aim).addScaledVector(X, sd * 0.5).addScaledVector(Z, -0.12);
         _f.copy(pu.aim).addScaledVector(X, -sd * 0.32).addScaledVector(Z, 0.1);
         out.lerpVectors(_w, _f, smooth(u));
         hand.pole.set(sd, 0.4, -0.2);
-        this.leanT = 0.08; this.twistT = sd * 0.1;
+        this.leanT = 0.08; this.twistT = sd * 0.14; this.crouchT = 0.05;
       } else {
         _w.copy(pu.aim).addScaledVector(Z, -0.1); _w.y -= 0.45;
         _f.copy(pu.aim).addScaledVector(Z, 0.1); _f.y += 0.35;
@@ -674,6 +685,12 @@ export class Opponent {
       const inst = Math.pow(1 - this.cons / 100, 1.5);
       this.leanT += Math.sin(this.clock * 1.7) * 0.09 * inst;
       this.slipT += Math.sin(this.clock * 1.1 + 1) * 0.12 * inst;
+      // a fighter never keeps his head still: small slips and dips in rhythm
+      if (this.mode === 'fight') {
+        this.slipT += Math.sin(this.clock * 1.6) * 0.035 + Math.sin(this.clock * 3.7) * 0.012;
+        this.leanT += Math.sin(this.clock * 2.2 + 0.5) * 0.015;
+        this.crouchT += 0.03 + Math.max(0, Math.sin(this.clock * 1.6 + 1.2)) * 0.02;
+      }
     }
 
     if (this.mode === 'idle') {
@@ -872,11 +889,9 @@ class FighterView {
     this.joints = f.p;   // particle name -> particle; positions read each frame
     this.J = {};
 
-    const shorts = new THREE.MeshStandardMaterial({ color: 0x9c1020, roughness: 0.4, metalness: 0.1 });
-    const glove = new THREE.MeshPhysicalMaterial({ color: 0x141414, roughness: 0.35, clearcoat: 0.8, clearcoatRoughness: 0.25 });
-    const dark = new THREE.MeshStandardMaterial({ color: 0x1b1210, roughness: 0.8 });
+    const dark = toonMaterial({ color: 0x1b1210 });
+    const white = toonMaterial({ color: 0xf6f2ea });
     const sphere = new THREE.SphereGeometry(1, 24, 16);
-    const cyl = new THREE.CylinderGeometry(1, 1, 1, 12);
     const add = (geo, mat, parent = this.group) => {
       const m = new THREE.Mesh(geo, mat);
       m.castShadow = true; m.receiveShadow = true;
@@ -884,23 +899,27 @@ class FighterView {
       return m;
     };
 
-    // face details ride on the head
+    // cartoon face details ride on the skinned head bone (placed in the rest pose, then carried by the bone)
     this.head = new THREE.Group(); this.group.add(this.head);
+    this.head.matrixAutoUpdate = false;
+    const hb = this.body.index.head;
+    this.headBone = this.body.bones[hb];
+    this.headRest = new THREE.Matrix4().copy(getHumanTemplate().rest[hb].m).invert()
+      .multiply(new THREE.Matrix4().makeTranslation(REST.head[0], REST.head[1], REST.head[2]));
     for (const sx of [-1, 1]) {
-      const eye = add(sphere, dark, this.head); eye.scale.set(0.012, 0.009, 0.006); eye.position.set(sx * 0.033, 0.006, 0.091);
-      const brow = add(sphere, dark, this.head); brow.scale.set(0.026, 0.006, 0.01); brow.position.set(sx * 0.034, 0.03, 0.098);
+      const eye = add(sphere, white, this.head); eye.scale.set(0.024, 0.026, 0.012); eye.position.set(sx * 0.046, 0.016, 0.106);
+      const pupil = add(sphere, dark, this.head); pupil.scale.set(0.011, 0.013, 0.006); pupil.position.set(sx * 0.043, 0.014, 0.117);
+      const brow = add(new THREE.BoxGeometry(1, 1, 1), dark, this.head); brow.scale.set(0.044, 0.012, 0.014);
+      brow.position.set(sx * 0.047, 0.052, 0.13); brow.rotation.z = sx * -0.25;   // a scowl
     }
-    const guard = add(sphere, new THREE.MeshStandardMaterial({ color: 0x2060ff, roughness: 0.3 }), this.head);
-    guard.scale.set(0.03, 0.009, 0.01); guard.position.set(0, -0.048, 0.092);
+    const guard = add(sphere, toonMaterial({ color: 0x2060ff }), this.head);
+    guard.scale.set(0.04, 0.012, 0.01); guard.position.set(0, -0.06, 0.136);
 
+    // 4 oz open-finger MMA gloves (left glove: thumb toward its right, i.e. local -x)
     this.gloves = [];
     for (const side of ['L', 'R']) {
-      const g = new THREE.Group(); this.group.add(g);
-      const mat = glove.clone();
-      const body = add(sphere, mat, g); body.scale.set(0.074, 0.068, 0.088);
-      const thumb = add(sphere, mat, g); thumb.scale.set(0.035, 0.04, 0.06);
-      thumb.position.set(side === 'L' ? -0.07 : 0.07, 0.04, 0.02);
-      const cuff = add(cyl, shorts, g); cuff.scale.set(0.058, 0.07, 0.058); cuff.rotation.x = Math.PI / 2; cuff.position.z = -0.085;
+      const { group: g, material: mat } = makeGlove(side === 'L' ? -1 : 1, { glove: 0x18181c, strap: 0xc0141c, skin: 0xb87a55 });
+      this.group.add(g);
       this.gloves.push({ g, mat, handState: f.hands[side], hand: f.p['hand' + side], elbow: f.p['elbow' + side] });
     }
     // a kicking foot glows as a warning
@@ -918,8 +937,7 @@ class FighterView {
     J.hipMid = null;
     this.body.update(J);
 
-    basisQuat(_w.subVectors(p.shoulderL.pos, p.shoulderR.pos), _f.subVectors(p.head.pos, p.neck.pos), _q);
-    this.head.quaternion.copy(_q); this.head.position.copy(p.head.pos);
+    this.head.matrix.multiplyMatrices(this.headBone.matrixWorld, this.headRest);
 
     for (const g of this.gloves) {
       const fwd = _w.subVectors(g.hand.pos, g.elbow.pos).normalize();
@@ -930,7 +948,7 @@ class FighterView {
       _by.crossVectors(_bz, _bx);
       _m.makeBasis(_bx, _by, _bz);
       g.g.quaternion.setFromRotationMatrix(_m);
-      g.g.position.copy(g.hand.pos);
+      g.g.position.copy(g.hand.pos).addScaledVector(fwd, 0.015);
       // Telegraph: the glove about to be thrown glows, brightening as the punch nears
       const pu = g.handState.punch;
       let glow = 0;
