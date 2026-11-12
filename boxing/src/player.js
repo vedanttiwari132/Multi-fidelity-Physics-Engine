@@ -8,9 +8,8 @@
 
 import * as THREE from 'three';
 import { Particle, DistanceConstraint, solveTwoBone } from './physics.js';
-import { clampToOctagon } from './arena.js';
 import { SkinnedBody, buildArmTemplate, makeGlove, toonMaterial } from './body.js';
-import { getHumanTemplate } from './fighter.js';
+import { Opponent } from './fighter.js';
 
 export const PUNCHES = {
   straight: { wind: 0.0, ext: 0.14, ret: 0.2, cost: 8, power: 1.0 },
@@ -51,7 +50,7 @@ export class Player {
     this.rotVel = new THREE.Vector3();
     this.dodgeOff = new THREE.Vector3();
     this.onDodge = null;  // (dir) => void
-    this.headRadius = 0.14;
+    this.headRadius = 0.125;
     this.keys = new Set();
     this.sensitivity = 0.0022;
     this.onPunch = null;  // (glove, type) => void  (punch started)
@@ -80,14 +79,20 @@ export class Player {
     world.addConstraint(new DistanceConstraint(hip, foot, { length: LEG, mode: 'max' }));
     this.leg = { side: 1, shoulder: hip, particle: foot, punch: null, queued: null, target: new THREE.Vector3(), lastTarget: new THREE.Vector3(), omega: 18, maxAcc: 200, isLeg: true };
     foot.glove = this.leg;
+    // Your body: the same active ragdoll as your opponent's, steered by your inputs.
+    this.wishVel = new THREE.Vector3();
+    this.dashVel = new THREE.Vector3();
+    this.lastH = 1 / 240;
+    this.body = new Opponent(world, scene, { pilot: this, colors: { skin: 0xd9a27c, shorts: 0x1840c0, trim: 0xf4f1ea, hair: 0x2a1a10, mouthguard: 0xe02828 } });
     this.view = new GloveView(scene, this);
     this.legView = new LegView(scene, this);
-    this.avatar = new PlayerAvatar(scene, this);
+    this.avatar = new PlayerAvatar(this);
     this.reset(0, 1.6, 0);
   }
 
   reset(x, z, yaw) {
-    this.pos.set(x, 0, z); this.vel.set(0, 0, 0);
+    this.pos.set(x, 0, z); this.vel.set(0, 0, 0); this.wishVel.set(0, 0, 0);
+    this.body.reset(x, z, yaw + Math.PI);
     this.yaw = yaw; this.pitch = -0.04; this.twist = 0; this.twistT = 0;
     this.standHeight = 1.6; this.duck = 0; this.lunge = 0; this.lungeT = 0; this.bobPhase = 0; this.clock = 0;
     this.headOff.set(0, 0, 0); this.headOffVel.set(0, 0, 0); this.rotOff.set(0, 0, 0); this.rotVel.set(0, 0, 0);
@@ -99,6 +104,7 @@ export class Player {
     for (const g of [...this.gloves, this.leg]) { g.punch = null; g.queued = null; }
     this.preStep(1 / 240);
     for (const g of [...this.gloves, this.leg]) { g.particle.teleport(g.target); g.particle.force.set(0, 0, 0); g.lastTarget.copy(g.target); }
+    this.body.reset(x, z, yaw + Math.PI);   // again, now that the gloves are where the hands should be
   }
 
   resetKeepHealth(x, z, yaw) {
@@ -128,8 +134,8 @@ export class Player {
     const sy = Math.sin(this.yaw), cy = Math.cos(this.yaw);
     const [lx, lz] = { forward: [0, 1], back: [0, -1], left: [-1, 0], right: [1, 0] }[dir];
     const speed = dir === 'left' || dir === 'right' ? 3.2 : 4.2;
-    this.vel.x += (lx * cy - lz * sy) * speed;
-    this.vel.z += (-lx * sy - lz * cy) * speed;
+    // the legs push off hard toward this velocity (see Opponent.balanceStep)
+    this.dashVel.set((lx * cy - lz * sy) * speed, 0, (-lx * sy - lz * cy) * speed);
     this.dashT = 0.22; this.dashCd = 0.4;
     if (dir === 'left' || dir === 'right') { this.dodgeCd = 0; this.requestDodge(dir); }
     this.onDash?.(dir);
@@ -229,13 +235,17 @@ export class Player {
     const kicking = !!this.leg.punch;
     const maxSp = (this.guarding ? 1.5 : 2.3) * (0.7 + 0.3 * this.stamina / 100) * (kicking ? 0.35 : 1) * (1 - 0.35 * inst);
     this.dashT -= h; this.dashCd -= h;
-    if (this.dashT <= 0) {
-      const ka = 1 - Math.exp(-h * (this.airborne ? 1.5 : 10));   // little control in the air
-      this.vel.x += (wx * maxSp - this.vel.x) * ka;
-      this.vel.z += (wz * maxSp - this.vel.z) * ka;
-    }
-    this.pos.addScaledVector(this.vel, h);
-    if (clampToOctagon(this.pos, 0.35) > 0) this.vel.multiplyScalar(0.5);   // the fence stops you
+    this.lastH = h;
+    // You move exactly like he does: this is only the velocity your legs try to reach.
+    // Your body (an active ragdoll) gets there as fast as its grip and balance allow.
+    if (this.dashT > 0) this.wishVel.copy(this.dashVel);
+    else this.wishVel.set(wx * maxSp, 0, wz * maxSp);
+    const b = this.body;
+    if (b.mode === 'fight' || b.mode === 'idle') {
+      const kf = 1 - Math.exp(-h * 40);   // (a touch of smoothing so the camera doesn't jitter with the pelvis)
+      this.pos.x += (b.base.x - this.pos.x) * kf; this.pos.z += (b.base.z - this.pos.z) * kf;
+      this.vel.copy(b.comVel);
+    } else this.vel.set(0, 0, 0);
 
     // jumping
     if (this.jumpY > 0 || this.jumpV > 0) {
@@ -300,6 +310,11 @@ export class Player {
     const fwx = -sy, fwz = -cy;
     const dxw = cy * this.dodgeOff.x - fwx * this.dodgeOff.z, dzw = -sy * this.dodgeOff.x - fwz * this.dodgeOff.z;
     this.headBase.set(this.pos.x + fwx * this.lunge + dxw, height, this.pos.z + fwz * this.lunge + dzw);
+    // going down: your view goes with your real head as your body falls
+    if (fallE > 0) {
+      _a.copy(this.body.p.head.pos); _a.y = Math.max(0.3, _a.y + 0.06);
+      this.headBase.lerp(_a, fallE);
+    }
     this.headPos.copy(this.headBase).add(this.headOff);
     this.headAnchor.moveKinematic(this.headBase);
     this.armBase.set(this.headBase.x - dxw * 0.65, this.headBase.y - this.dodgeOff.y * 0.5, this.headBase.z - dzw * 0.65);
@@ -341,6 +356,9 @@ export class Player {
 
     // --- stamina
     this.stamina = Math.min(100, this.stamina + h * (this.guarding ? 7 : 15));
+
+    // --- your body follows (same muscles, legs and balance as the opponent)
+    this.body.preStep(h, null);
   }
 
   /** Glove target in head-local coordinates: x right, y up, -z forward. */
@@ -452,7 +470,8 @@ export class Player {
   }
 
   /** impulse: N·s delivered to your head/body by the opponent's glove. */
-  takeHit(impulse, dmg, region) {
+  /** physical: the strike already pushed your real body (it hit your torso or legs). */
+  takeHit(impulse, dmg, region, physical = false) {
     const m = region === 'head' ? 5 : 20;
     _v.copy(impulse).multiplyScalar(1 / m);
     if (_v.length() > 4) _v.setLength(4);
@@ -463,7 +482,7 @@ export class Player {
     this.rotVel.z += -lateral * 0.05;
     this.rotVel.y += -lateral * 0.04;
     this.rotVel.x += impulse.y * 0.04 - forward * 0.02;
-    this.vel.x += impulse.x / 70; this.vel.z += impulse.z / 70;
+    if (!physical) this.body.react(impulse, region, this.lastH);   // a head shot rocks your real body too
     this.health = Math.max(0, this.health - dmg);
   }
 
@@ -581,7 +600,6 @@ function placeCylinder(mesh, a, b, r) {
 // ---------------------------------------------------------------------------
 // Third-person body, only shown by the knockout cam (you never see it in first person).
 const _ax = new THREE.Vector3(), _ay = new THREE.Vector3(), _az = new THREE.Vector3();
-const _p1 = new THREE.Vector3(), _p2 = new THREE.Vector3(), _p3 = new THREE.Vector3(), _p4 = new THREE.Vector3();
 
 function orient(obj, xDir, yDir) {
   _ax.copy(xDir).normalize();
@@ -591,65 +609,16 @@ function orient(obj, xDir, yDir) {
   obj.quaternion.setFromRotationMatrix(_m);
 }
 
+/** Your body as others (and the replays) see it: the ragdoll's own skinned view. */
 class PlayerAvatar {
-  constructor(scene, player) {
+  constructor(player) {
     this.player = player;
-    // the same continuous skinned body as your opponent, in blue
-    this.body = new SkinnedBody(scene, getHumanTemplate(), { skin: 0xd9a27c, shorts: 0x1840c0, trim: 0xf4f1ea, hair: 0x2a1a10 });
-    this.body.visible = false;
-    this.group = this.body;   // .visible toggles the whole avatar
-    this.phase = 0;   // stepping cycle, advanced by how fast you move (same as the opponent's)
-    const V = () => new THREE.Vector3();
-    this.J = { head: V(), neck: V(), chest: V(), shoulderL: V(), shoulderR: V(), elbowL: V(), elbowR: V(), handL: V(), handR: V(),
-      belly: V(), pelvis: V(), hipL: V(), hipR: V(), kneeL: V(), kneeR: V(), footL: V(), footR: V() };
+    this.phase = 0;   // (kept in replay frames for compatibility)
+    const view = player.body.view;
+    view.visible = false;   // hidden in first person
+    this.group = { get visible() { return view.visible; }, set visible(v) { view.visible = v; } };
   }
 
-  tick(dt) {
-    const p = this.player;
-    this.phase += Math.hypot(p.vel.x, p.vel.z) * dt * 11;
-  }
-
-  update() {
-    const p = this.player, J = this.J;
-    const yaw = p.yaw + p.twist;
-    const sy = Math.sin(yaw), cy = Math.cos(yaw);
-    const left = _p1.set(-cy, 0, sy);          // the player's left
-    const fwd = _p2.set(-sy, 0, -cy);
-    const sL = p.gloves[0].shoulder.pos, sR = p.gloves[1].shoulder.pos;
-    const hip = J.pelvis.set(p.pos.x, 0.93 - p.duck * 0.6 - p.punchDuck * 0.5 + p.jumpY, p.pos.z);
-    // your left glove is gloves[0]; the body's left arm is its +x side (its own left)
-    J.shoulderL.copy(sL).addScaledVector(left, 0.02); J.shoulderR.copy(sR).addScaledVector(left, -0.02);
-    const sMid = _p3.addVectors(J.shoulderL, J.shoulderR).multiplyScalar(0.5);
-    J.head.copy(p.headAnchor.pos);
-    J.neck.lerpVectors(sMid, J.head, 0.42);
-    J.chest.lerpVectors(sMid, hip, 0.3);
-    J.belly.lerpVectors(sMid, hip, 0.66);
-    J.handL.copy(p.gloves[0].particle.pos); J.handR.copy(p.gloves[1].particle.pos);
-    for (const [side, g] of [['L', p.gloves[0]], ['R', p.gloves[1]]]) {
-      _pole.set(0, -1, 0).addScaledVector(left, side === 'L' ? 0.7 : -0.7).addScaledVector(fwd, -0.3);
-      solveTwoBone(J['shoulder' + side], g.particle.pos, 0.33, 0.37, _pole, J['elbow' + side]);
-    }
-
-    const speed = Math.hypot(p.vel.x, p.vel.z);
-    const amt = Math.min(1, speed * 1.5);
-    const mx = speed > 1e-4 ? p.vel.x / speed : 0, mz = speed > 1e-4 ? p.vel.z / speed : 0;
-    for (const side of ['L', 'R']) {
-      const sg = side === 'L' ? 1 : -1;        // +1 = left
-      const ph = this.phase + (sg > 0 ? 0 : Math.PI);
-      const fwdOff = sg > 0 ? 0.17 : -0.15;
-      const hipJ = J['hip' + side].copy(hip).addScaledVector(left, sg * 0.11);
-      hipJ.y -= 0.04;
-      const shuffle = Math.cos(ph) * 0.08 * amt;
-      const foot = J['foot' + side].set(p.pos.x + left.x * sg * 0.15 + fwd.x * fwdOff + mx * shuffle,
-        0.07 + Math.max(0, Math.sin(ph)) * 0.09 * amt + p.jumpY,
-        p.pos.z + left.z * sg * 0.15 + fwd.z * fwdOff + mz * shuffle);
-      _a.copy(fwd).addScaledVector(left, sg * 0.25);
-      // the kicking leg (left leg is side -1 in the player's own terms) follows the real foot
-      const kicking = p.leg.particle.pos.y > 0.3 && (p.leg.side < 0) === (sg > 0);
-      if (kicking) { foot.copy(p.leg.particle.pos); _a.set(0, 0.5, 0).addScaledVector(fwd, 1); }
-      solveTwoBone(hipJ, foot, kicking ? 0.5 : 0.41, kicking ? 0.55 : 0.44, _a, J['knee' + side]);
-    }
-    J.hipMid = null;
-    this.body.update(J);
-  }
+  tick() {}
+  update() { this.player.body.view.update(); }
 }

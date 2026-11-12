@@ -39,9 +39,9 @@ const REST = {
 const LINKS = [
   ['head', 'neck', 1], ['neck', 'chest', 1], ['neck', 'shoulderL', 1], ['neck', 'shoulderR', 1],
   ['chest', 'shoulderL', 1], ['chest', 'shoulderR', 1], ['shoulderL', 'shoulderR', 1],
-  ['chest', 'belly', 1], ['belly', 'pelvis', 1], ['chest', 'pelvis', 0.6], ['neck', 'belly', 0.4],
-  ['shoulderL', 'belly', 0.6], ['shoulderR', 'belly', 0.6],
-  ['pelvis', 'hipL', 1], ['pelvis', 'hipR', 1], ['hipL', 'hipR', 1], ['belly', 'hipL', 0.6], ['belly', 'hipR', 0.6],
+  ['chest', 'belly', 1], ['belly', 'pelvis', 1], ['chest', 'pelvis', 1], ['neck', 'belly', 0.8],
+  ['shoulderL', 'belly', 0.9], ['shoulderR', 'belly', 0.9],
+  ['pelvis', 'hipL', 1], ['pelvis', 'hipR', 1], ['hipL', 'hipR', 1], ['belly', 'hipL', 0.9], ['belly', 'hipR', 0.9],
   ['shoulderL', 'elbowL', 1, 'equal', UPPER_ARM], ['elbowL', 'handL', 1, 'equal', FOREARM],
   ['shoulderR', 'elbowR', 1, 'equal', UPPER_ARM], ['elbowR', 'handR', 1, 'equal', FOREARM],
   ['hipL', 'kneeL', 1, 'equal', THIGH], ['kneeL', 'footL', 1, 'equal', SHIN],
@@ -59,7 +59,17 @@ const LINKS = [
   ['kneeL', 'belly', 1, 'min', 0.3], ['kneeR', 'belly', 1, 'min', 0.3],        // thighs can't fold into the stomach
   ['kneeL', 'chest', 1, 'min', 0.42], ['kneeR', 'chest', 1, 'min', 0.42],
   ['footL', 'pelvis', 1, 'min', 0.3], ['footR', 'pelvis', 1, 'min', 0.3],
+  // range limits as a fraction of the rest length: [shortest, longest]
+  ['shoulderL', 'hipR', 0.7, 'range', [0.85, 1.12]], ['shoulderR', 'hipL', 0.7, 'range', [0.85, 1.12]],   // torso twist and side bend
+  ['head', 'shoulderL', 0.8, 'range', [0.8, 1.15]], ['head', 'shoulderR', 0.8, 'range', [0.8, 1.15]],       // neck tilt
+  ['head', 'pelvis', 0.6, 'range', [0.75, 1.04]],                                                          // spine flex
+  ['elbowL', 'shoulderR', 1, 'min', 0.3], ['elbowR', 'shoulderL', 1, 'min', 0.3],                          // arms can't fold across the chest
+  ['kneeL', 'kneeR', 1, 'max', 1.15], ['footL', 'footR', 1, 'max', 1.6],                                   // no splits
+  ['kneeL', 'hipR', 1, 'min', 0.16], ['kneeR', 'hipL', 1, 'min', 0.16],                                    // legs can't cross through each other
 ];
+// limb links that get joint damping when the body goes limp (so it falls like a body, not a rope)
+const LIMBS = [['shoulderL', 'elbowL'], ['elbowL', 'handL'], ['shoulderR', 'elbowR'], ['elbowR', 'handR'],
+  ['hipL', 'kneeL'], ['kneeL', 'footL'], ['hipR', 'kneeR'], ['kneeR', 'footR'], ['neck', 'head']];
 
 const REGION = {
   head: 'head', neck: 'head',
@@ -131,8 +141,15 @@ const _z = new THREE.Vector3();
 const _pole = new THREE.Vector3();
 
 export class Opponent {
-  constructor(world, scene) {
+  /**
+   * opts.pilot: drive this body from a Player's inputs instead of the AI. The player's
+   * body then moves with exactly the same physics as the AI fighter: grip-limited leg
+   * drive, planted feet and recovery steps, balance, stumbles and real ragdoll falls.
+   * opts.colors: { skin, shorts, mouthguard }.
+   */
+  constructor(world, scene, opts = {}) {
     this.world = world;
+    this.pilot = opts.pilot || null;
     this.p = {};
     this.list = [];
     this.local = {};
@@ -154,9 +171,14 @@ export class Opponent {
     }
     const linked = new Set();
     for (const [a, b, stiffness, mode = 'equal', length = null] of LINKS) {
-      world.addConstraint(new DistanceConstraint(this.p[a], this.p[b], { stiffness, mode, length }));
+      if (mode === 'range') {
+        const rest = this.p[a].pos.distanceTo(this.p[b].pos);
+        world.addConstraint(new DistanceConstraint(this.p[a], this.p[b], { stiffness, mode: 'min', length: rest * length[0] }));
+        world.addConstraint(new DistanceConstraint(this.p[a], this.p[b], { stiffness, mode: 'max', length: rest * length[1] }));
+      } else world.addConstraint(new DistanceConstraint(this.p[a], this.p[b], { stiffness, mode, length }));
       linked.add(a + '|' + b); linked.add(b + '|' + a);
     }
+    this.limbs = LIMBS.map(([a, b]) => [this.p[a], this.p[b]]);
     // Knees only bend forwards.
     for (const s of ['L', 'R']) {
       world.addConstraint(new HingeConstraint(this.p['hip' + s], this.p['knee' + s], this.p['foot' + s], this.p.hipR, this.p.hipL));
@@ -172,7 +194,7 @@ export class Opponent {
         const pa = this.p[a], pb = this.p[b];
         const minD = pa.radius + pb.radius;
         if (pa.pos.distanceTo(pb.pos) < minD * 1.02) continue;
-        world.addConstraint(new DistanceConstraint(pa, pb, { mode: 'min', length: minD, stiffness: 0.8 }));
+        world.addConstraint(new DistanceConstraint(pa, pb, { mode: 'min', length: minD, stiffness: 1 }));
         this.selfCollisions++;
       }
     }
@@ -186,6 +208,22 @@ export class Opponent {
     this.p.handR.hand = this.hands.R;
     // kicks are tracked like a third hand, so blocking, dodging and hit checks treat them the same way
     this.kickSlot = { name: 'kick', punch: null };
+    // Hitboxes along the limbs and torso (capsules between particles, sized to the visible body),
+    // so a forearm blocks, a shin takes a kick and nothing slips through the gaps between joints.
+    const P = this.p;
+    const seg = (a, b, r, region, extra = {}) => ({ a: P[a], b: P[b], r, region, name: a + '-' + b, mass: (P[a].mass + P[b].mass) / 2, owner: this, ...extra });
+    this.segs = [
+      seg('shoulderL', 'elbowL', 0.065, 'guard'), seg('elbowL', 'handL', 0.06, 'guard', { hand: this.hands.L }),
+      seg('shoulderR', 'elbowR', 0.065, 'guard'), seg('elbowR', 'handR', 0.06, 'guard', { hand: this.hands.R }),
+      seg('neck', 'head', 0.065, 'head'),
+      seg('chest', 'belly', 0.15, 'body'), seg('shoulderL', 'shoulderR', 0.08, 'body'),
+      seg('belly', 'pelvis', 0.14, 'low'),
+      seg('hipL', 'kneeL', 0.09, 'low'), seg('kneeL', 'footL', 0.065, 'low', { kicker: this.kickSlot, name: 'footL' }),
+      seg('hipR', 'kneeR', 0.09, 'low'), seg('kneeR', 'footR', 0.065, 'low', { kicker: this.kickSlot, name: 'footR' }),
+    ];
+    // what a strike meets, in order: the guard first, then the head, body and legs
+    const RANK = { guard: 0, head: 1, body: 2, low: 3 };
+    this.hurt = [...this.list, ...this.segs].sort((x, y) => RANK[x.region] - RANK[y.region]);
 
     this.base = new THREE.Vector3();
     this.home = new THREE.Vector3();
@@ -201,7 +239,7 @@ export class Opponent {
      *  { pos, vel, head, gloves: [left, right], yaw } in world space (their camera yaw). */
     this.remote = null;
     this.onSwing = null;
-    this.view = new FighterView(scene, this);
+    this.view = new FighterView(scene, this, opts.colors);
     this.reset(0, -1.6, 0);
   }
 
@@ -272,18 +310,23 @@ export class Opponent {
       dy = Math.atan2(Math.sin(dy), Math.cos(dy));
       this.yaw += dy * (1 - Math.exp(-h * 16));
     } else if (upright) {
+      if (this.pilot) { this.thinkPilot(h); this.balance = this.pilot.balance; }
       this.balanceStep(h);
+      if (this.pilot) this.pilot.balance = this.balance;
       let dy = this.desiredYaw - this.yaw;
       dy = Math.atan2(Math.sin(dy), Math.cos(dy));
-      this.yaw += Math.max(-6 * h, Math.min(6 * h, dy));
+      const turn = this.pilot ? 12 : 6;   // you turn your body as fast as you can step it round
+      this.yaw += Math.max(-turn * h, Math.min(turn * h, dy));
     } else {
+      if (this.pilot) this.thinkPilot(h);
       this.moveVel.set(0, 0, 0);
       this.support = 1;
     }
     if (this.remote) clampToOctagon(this.base, 0.7);
     for (const r in this.relax) this.relax[r] = Math.max(0, this.relax[r] - h);
     // jumping (the superman punch)
-    if (!this.remote && (this.jumpV > 0 || this.base.y > 0)) {
+    if (this.pilot) this.base.y = this.pilot.jumpY;
+    else if (!this.remote && (this.jumpV > 0 || this.base.y > 0)) {
       this.jumpV -= 9.81 * h;
       this.base.y = Math.max(0, this.base.y + this.jumpV * h);
       if (this.base.y === 0) this.jumpV = 0;
@@ -342,14 +385,16 @@ export class Opponent {
     this.support = grounded || st || this.base.y > 0.02 ? THREE.MathUtils.clamp(1 - this.offBalance / 0.5, 0, 1) : 0.35;
     // being off balance uses up balance (a kick does too); run out, or get knocked
     // further than any step could catch, and you go down
-    this.balance -= this.offBalance * h * (kick ? 60 : 200);
-    if ((this.balance <= 0 || this.offBalance > 0.6) && this.mode === 'fight') { this.trip(); return; }
+    // a dash is an explosive push-off and a planted stop: the feet grip harder, and you mean to be moving
+    const dash = this.pilot && this.pilot.dashT > -0.35;
+    if (!dash) this.balance -= this.offBalance * h * (kick ? 60 : 200);
+    if ((this.balance <= 0 || this.offBalance > (dash ? 1.2 : 0.6)) && this.mode === 'fight') { this.trip(); return; }
 
     // legs push the body toward where the AI wants to go, limited by grip
     if (grounded && this.tone > 0.3) {
       let ax = (this.desiredVel.x - vx) * 6, az = (this.desiredVel.z - vz) * 6;
       // feet can only push (or brake) as hard as their grip allows; off balance, even less
-      const lim = 0.5 * 9.81 * (grounded === 2 ? 1 : 0.6) * this.tone * (0.4 + 0.6 * this.support);
+      const lim = 0.5 * 9.81 * (grounded === 2 ? 1 : 0.6) * this.tone * (0.4 + 0.6 * this.support) * (dash ? 4 : 1);
       const al = Math.hypot(ax, az);
       if (al > lim) { ax *= lim / al; az *= lim / al; }
       for (const n of ['pelvis', 'belly', 'chest', 'hipL', 'hipR']) { p[n].force.x += ax * p[n].mass * M / 50; p[n].force.z += az * p[n].mass * M / 50; }
@@ -424,7 +469,7 @@ export class Opponent {
           T[name].lerpVectors(st.from, st.to, u);
           T[name].y = this.local[name].y + Math.sin(Math.PI * u) * 0.09;
         } else T[name].copy(this.plant[name]);
-        T[name].y += this.base.y;   // (lifted along with a jump)
+        T[name].y += this.base.y * 2.1;   // lifted with a jump, knees tucked
         continue;
       }
       const sn = Math.sin(this.stepPhase + ph);
@@ -439,6 +484,7 @@ export class Opponent {
     const kick = this.kickSlot.punch;
     if (kick) {
       if (this.remote) T[kick.foot].copy(this.remote.kickPos);
+      else if (this.pilot) T[kick.foot].copy(this.pilot.leg.particle.pos);
       else this.kickTarget(kick, h, T[kick.foot]);
     }
 
@@ -489,9 +535,9 @@ export class Opponent {
 
   handTarget(hand, h, ctx, out) {
     const sd = hand.side;
-    if (this.remote) {
+    if (this.remote || this.pilot) {
       // Their left glove is this body's left hand.
-      out.copy(this.remote.gloves[sd > 0 ? 0 : 1]);
+      out.copy(this.remote ? this.remote.gloves[sd > 0 ? 0 : 1] : this.pilot.gloves[sd > 0 ? 0 : 1].particle.pos);
       hand.omega = 30; hand.maxAcc = 420;
       hand.pole.set(sd * 0.7, -1, -0.2);
       return out;
@@ -593,6 +639,8 @@ export class Opponent {
       // a hit relaxes the struck area for a moment: the head snaps, the body folds, then recovers
       if (this.relax.head > 0 && (name === 'head' || name === 'neck')) { w *= 0.35; maxAcc *= 0.3; }
       if (this.relax.body > 0 && (name === 'chest' || name === 'belly')) { w *= 0.55; maxAcc *= 0.5; }
+      // in the air the legs tuck up fast (it's how you clear a low kick)
+      if (this.base.y > 0.02 && (name.startsWith('foot') || name.startsWith('knee'))) { w = 30; maxAcc = 320; }
       const k = this.kickSlot.punch;
       if (k && k.foot === name) {
         const P = this.remote ? 1 : this.diff.power * k.def.power;
@@ -612,6 +660,17 @@ export class Opponent {
       p.force.y += p.mass * G * grav;
       if (internal && !name.startsWith('foot')) { sumX += _f.x; sumZ += _f.z; sumM += p.mass; }
       LT.copy(T);
+    }
+    // Joint damping: a limp body keeps some resistance in its joints, so limbs swing heavily
+    // instead of whipping around like rope. Fades out as muscle tone comes back.
+    const jd = 1 - Math.exp(-h * 9 * Math.max(0, 1 - tone * 1.6));
+    if (jd > 1e-4) {
+      for (const [a, b] of this.limbs) {
+        const rx = (b.pos.x - b.prev.x) - (a.pos.x - a.prev.x), ry = (b.pos.y - b.prev.y) - (a.pos.y - a.prev.y), rz = (b.pos.z - b.prev.z) - (a.pos.z - a.prev.z);
+        const wa = a.invMass / (a.invMass + b.invMass), wb = 1 - wa;
+        a.prev.x -= rx * jd * wa; a.prev.y -= ry * jd * wa; a.prev.z -= rz * jd * wa;
+        b.prev.x += rx * jd * wb; b.prev.y += ry * jd * wb; b.prev.z += rz * jd * wb;
+      }
     }
     if (internal && sumM > 0) {
       const ax = sumX / sumM, az = sumZ / sumM;
@@ -649,7 +708,55 @@ export class Opponent {
     this.desiredVel.set(0, 0, 0);
   }
 
+  /**
+   * Your own body: the same muscles, legs and balance as the AI fighter, but steered by
+   * your inputs. Posture follows where you hold your head, the hands chase your gloves,
+   * and the legs push toward the velocity you ask for.
+   */
+  thinkPilot(dt) {
+    const pl = this.pilot, m = pl.mode;
+    if (m === 'down' || m === 'tripped') {
+      if (this.mode !== m) { this.mode = m; this.stepping = null; this.tripT = 0; }
+      this.tone = Math.max(m === 'tripped' ? 0.03 : 0, this.tone - dt * (m === 'tripped' ? 6 : 5));
+    } else if (this.mode === 'down' || this.mode === 'tripped') {
+      this.rise(this.health, true);
+    } else if (this.mode === 'rising') {
+      this.tone = Math.min(1, this.tone + dt * 0.9);
+      if (this.tone >= 1 && m !== 'rising') this.mode = m;
+    } else {
+      this.mode = m === 'rising' ? 'fight' : m;
+      this.tone = 0.45 + 0.55 * Math.pow(pl.cons / 100, 0.7);   // the lower your consciousness, the wobblier
+    }
+    const fx = -Math.sin(pl.yaw), fz = -Math.cos(pl.yaw);   // your forward
+    const lx = -Math.cos(pl.yaw), lz = Math.sin(pl.yaw);    // your left
+    const dx = pl.headBase.x - pl.pos.x, dz = pl.headBase.z - pl.pos.z;
+    this.leanT = THREE.MathUtils.clamp((dx * fx + dz * fz) / 1.4, -0.2, 0.3);
+    this.slipT = THREE.MathUtils.clamp((dx * lx + dz * lz) / 1.4, -0.3, 0.3);
+    this.crouchT = THREE.MathUtils.clamp(pl.standHeight - (pl.headBase.y - pl.jumpY), -0.05, 0.45);
+    this.twistT = 0;
+    this.cover = false; this.coverLow = false;
+    this.cons = pl.cons; this.health = pl.health;
+    this.desiredVel.copy(pl.wishVel);
+    this.desiredYaw = pl.yaw + Math.PI;
+    // your kick, so the standing leg takes the weight and the kicking leg follows your foot
+    const lp = pl.leg.punch;
+    if (lp && this.mode === 'fight') {
+      const foot = pl.leg.side < 0 ? 'footL' : 'footR';
+      if (!this.kickSlot.punch) this.kickSlot.punch = { def: { power: 1, kind: 'kick' }, foot, phase: lp.phase, t: 0, wind: 1 };
+      this.kickSlot.punch.phase = lp.phase;
+    } else this.kickSlot.punch = null;
+  }
+
+  /** Your body reacts to a hit you take (the damage is handled by the Player). */
+  react(imp, region, h) {
+    if (!imp || imp.lengthSq() < 1e-8) return;
+    const p = region === 'head' ? this.p.head : this.p.chest;
+    p.applyImpulse(imp, h);
+    this.relax[region === 'head' ? 'head' : 'body'] = 0.25;
+  }
+
   think(dt, ctx) {
+    if (this.pilot) return;   // driven every physics step instead (thinkPilot)
     if (this.remote) { this.thinkRemote(dt); return; }
     this.winded = Math.max(0, (this.winded || 0) - dt * 0.08);
     this.coverT -= dt; this.coverLowT = (this.coverLowT || 0) - dt; this.slipTimer -= dt; this.tacticT -= dt; this.attackCd -= dt; this.staggerT -= dt;
@@ -831,6 +938,7 @@ export class Opponent {
 
   /** Swept off his feet: down briefly, then straight back up (no count). */
   trip() {
+    if (this.pilot) { this.mode = 'tripped'; this.stepping = null; if (this.pilot.mode === 'fight') this.pilot.trip(); return; }
     this.mode = 'tripped';
     this.tripT = 0;
     this.balance = 70;
@@ -880,12 +988,13 @@ export function getHumanTemplate() {
 }
 
 class FighterView {
-  constructor(scene, f) {
+  constructor(scene, f, colors = {}) {
     this.f = f;
+    const C = { skin: 0xb87a55, shorts: 0x9c1020, trim: 0xf2e6c8, hair: 0x1b1210, mouthguard: 0x2060ff, ...colors };
     this.group = new THREE.Group();
     scene.add(this.group);
     // one continuous skinned body, posed from the ragdoll's particles
-    this.body = new SkinnedBody(scene, getHumanTemplate(), { skin: 0xb87a55, shorts: 0x9c1020, trim: 0xf2e6c8, hair: 0x1b1210 });
+    this.body = new SkinnedBody(scene, getHumanTemplate(), { skin: C.skin, shorts: C.shorts, trim: C.trim, hair: C.hair });
     this.joints = f.p;   // particle name -> particle; positions read each frame
     this.J = {};
 
@@ -912,13 +1021,13 @@ class FighterView {
       const brow = add(new THREE.BoxGeometry(1, 1, 1), dark, this.head); brow.scale.set(0.044, 0.012, 0.014);
       brow.position.set(sx * 0.047, 0.052, 0.13); brow.rotation.z = sx * -0.25;   // a scowl
     }
-    const guard = add(sphere, toonMaterial({ color: 0x2060ff }), this.head);
+    const guard = add(sphere, toonMaterial({ color: C.mouthguard }), this.head);
     guard.scale.set(0.04, 0.012, 0.01); guard.position.set(0, -0.06, 0.136);
 
     // 4 oz open-finger MMA gloves (left glove: thumb toward its right, i.e. local -x)
     this.gloves = [];
     for (const side of ['L', 'R']) {
-      const { group: g, material: mat } = makeGlove(side === 'L' ? -1 : 1, { glove: 0x18181c, strap: 0xc0141c, skin: 0xb87a55 });
+      const { group: g, material: mat } = makeGlove(side === 'L' ? -1 : 1, { glove: 0x18181c, strap: 0xc0141c, skin: C.skin });
       this.group.add(g);
       this.gloves.push({ g, mat, handState: f.hands[side], hand: f.p['hand' + side], elbow: f.p['elbow' + side] });
     }
@@ -930,6 +1039,9 @@ class FighterView {
       return { m, name: 'foot' + side, foot: f.p['foot' + side], glow: 0 };
     });
   }
+
+  get visible() { return this.group.visible; }
+  set visible(v) { this.group.visible = v; this.body.visible = v; }
 
   update() {
     const p = this.f.p, J = this.J;
@@ -959,7 +1071,7 @@ class FighterView {
       g.mat.emissiveIntensity = g.glow;
       g.g.scale.setScalar(1 + g.glow * 0.04);
     }
-    const k = this.f.kickSlot.punch;
+    const k = this.f.pilot ? null : this.f.kickSlot.punch;   // only his kicks are telegraphed
     for (const fg of this.footGlow) {
       const glow = k && k.foot === fg.name ? (k.phase === 'wind' ? 0.25 + 0.5 * Math.min(1, k.t / k.wind) : k.phase === 'ext' ? 0.55 : 0) : 0;
       fg.glow += (glow - fg.glow) * 0.35;

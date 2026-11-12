@@ -257,3 +257,46 @@ export function solveTwoBone(root, end, l1, l2, pole, out) {
   _ikPole.normalize();
   return out.copy(root).addScaledVector(_ikDir, along).addScaledVector(_ikPole, h);
 }
+
+const _cp = new THREE.Vector3(), _cv = new THREE.Vector3();
+/**
+ * Particle vs a capsule (segment a–b of radius r, e.g. a forearm), with an impulse.
+ * The capsule's two end particles share the push by how close the contact is to each.
+ * Returns the closing speed (>= 0) when touching, -1 otherwise. `outImpulse` receives
+ * the impulse applied to the capsule.
+ */
+export function collideParticleCapsule(p, a, b, r, dt, e = 0.15, outImpulse = null) {
+  _a.subVectors(b.pos, a.pos);
+  const l2 = _a.lengthSq();
+  let t = l2 > 1e-12 ? _v.subVectors(p.pos, a.pos).dot(_a) / l2 : 0;
+  t = Math.min(1, Math.max(0, t));
+  _cp.copy(a.pos).addScaledVector(_a, t);
+  _n.subVectors(_cp, p.pos);                 // from the particle to the capsule
+  const minD = p.radius + r;
+  const d2 = _n.lengthSq();
+  if (d2 >= minD * minD) return -1;
+  const wa = a.invMass * (1 - t) * (1 - t), wb = b.invMass * t * t;   // effective inverse mass at the contact point
+  const w = p.invMass + wa + wb;
+  if (w === 0) return -1;
+  const d = Math.sqrt(d2) || 1e-6;
+  _n.multiplyScalar(1 / d);
+  // velocity of the contact point on the capsule
+  _cv.set(0, 0, 0)
+    .addScaledVector(_v.subVectors(a.pos, a.prev), 1 - t)
+    .addScaledVector(_v.subVectors(b.pos, b.prev), t);
+  _v.subVectors(p.pos, p.prev).sub(_cv);
+  const vrel = _v.dot(_n) / dt;
+  if (vrel > 0) {
+    const j = ((1 + e) * vrel) / w;
+    p.prev.addScaledVector(_n, j * p.invMass * dt);
+    a.prev.addScaledVector(_n, -j * a.invMass * (1 - t) * dt);
+    b.prev.addScaledVector(_n, -j * b.invMass * t * dt);
+    if (outImpulse) outImpulse.copy(_n).multiplyScalar(j);
+  } else if (outImpulse) outImpulse.set(0, 0, 0);
+  const pen = minD - d;
+  const sp = (pen * p.invMass) / w, sa = (pen * wa) / w, sb = (pen * wb) / w;
+  p.pos.addScaledVector(_n, -sp); p.prev.addScaledVector(_n, -sp);
+  a.pos.addScaledVector(_n, sa * (1 - t)); a.prev.addScaledVector(_n, sa * (1 - t));
+  b.pos.addScaledVector(_n, sb * t); b.prev.addScaledVector(_n, sb * t);
+  return Math.max(vrel, 0);
+}

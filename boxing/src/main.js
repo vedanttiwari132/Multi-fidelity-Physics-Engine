@@ -1,7 +1,7 @@
 // Knockout Physics — game loop, rules and HUD.
 
 import * as THREE from 'three';
-import { World, collideParticles, collideParticleSphere } from './physics.js';
+import { World, collideParticles, collideParticleSphere, collideParticleCapsule } from './physics.js';
 import { Opponent, PUNCH_LABEL } from './fighter.js';
 import { Player } from './player.js';
 import { Arena } from './arena.js';
@@ -34,7 +34,7 @@ scene.background = new THREE.Color(0x07080c);
 scene.fog = new THREE.Fog(0x07080c, 14, 32);
 const camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.03, 100);
 
-const world = new World({ iterations: 6 });
+const world = new World({ iterations: 10 });   // more solver passes: stiffer joints, less stretch
 const arena = new Arena(scene, world);
 const player = new Player(world, scene);
 const opp = new Opponent(world, scene);
@@ -59,10 +59,27 @@ game.stats = newStats();
 // ---------------------------------------------------------------- contacts
 const impulse = new THREE.Vector3();
 const BODY_PARTS = ['head', 'neck', 'chest', 'belly', 'pelvis', 'shoulderL', 'shoulderR', 'hipL', 'hipR', 'kneeL', 'kneeR'];
-const LEGS_RADIUS = 0.22;
 // his feet can block your strikes too, but only the foot he's kicking with counts as an attack
 opp.p.footL.kicker = opp.kickSlot; opp.p.footR.kicker = opp.kickSlot;
 const attackOf = (p) => p.hand?.punch || (p.kicker?.punch && p.kicker.punch.foot === p.name ? p.kicker.punch : null);
+
+// Hitboxes. His: every body particle plus capsules along his limbs and torso (opp.hurt),
+// guard first. Yours: a head sphere exactly where your eyes are (so a slip or duck counts
+// the moment you make it) and your real ragdoll torso and legs for everything else.
+const HEAD_R = 0.125;
+const myHurt = player.body.hurt.filter((it) => it.region === 'body' || it.region === 'low');
+const hitTest = (p, it, h, e) => it.a ? collideParticleCapsule(p, it.a, it.b, it.r, h, e, impulse) : collideParticles(p, it, h, e, impulse);
+
+/** One of his strikes (hand or kicking foot) against you. */
+function strikePlayer(p, slot, h, headOnly = false) {
+  const s = collideParticleSphere(p, player.headPos, HEAD_R, player.headVel, 1 / 5, h, 0.1, impulse);
+  if (s >= 0) { onPlayerStruck(slot, s, impulse, 'head'); return; }
+  if (headOnly) return;
+  for (const it of myHurt) {
+    const t = hitTest(p, it, h, 0.1);
+    if (t >= 0) { onPlayerStruck(slot, t, impulse, it.region === 'low' ? 'legs' : 'body', true); return; }
+  }
+}
 
 world.collisionHook = (h, iter) => {
   const leg = player.leg;
@@ -73,52 +90,33 @@ world.collisionHook = (h, iter) => {
     const aroundArms = (type === 'bodyhook' || type === 'kick') && g.punch.phase !== 'ret' && !opp.coverLow;
     // Resting gloves don't parry for you: his strikes only meet your gloves when you hold guard or are punching.
     const gloveActive = player.guarding || !!g.punch;
-    for (const p of opp.list) {
-      if (aroundArms && p.region === 'guard') continue;
-      if ((p.hand || attackOf(p)) && !gloveActive) continue;
-      const s = collideParticles(g.particle, p, h, 0.15);
-      if (s >= 0) onGloveContact(g, p, s);
+    if (g.isLeg && g.punch?.done) continue;   // a kick that landed carries on through: it doesn't keep shoving
+    for (const it of opp.hurt) {
+      if (aroundArms && it.region === 'guard') continue;
+      if ((it.hand || attackOf(it)) && !gloveActive) continue;
+      const s = it.a ? collideParticleCapsule(g.particle, it.a, it.b, it.r, h, 0.15) : collideParticles(g.particle, it, h, 0.15);
+      if (s >= 0) onGloveContact(g, it, s);
     }
   }
   if (game.phase !== 'menu') {
-    for (const hand of opp.handList) {
-      const hp = opp.p[hand.name];
-      let s = collideParticleSphere(hp, player.headPos, player.headRadius, player.headVel, 1 / 5, h, 0.1, impulse);
-      if (s >= 0) onPlayerStruck(hand, s, impulse, 'head');
-      s = collideParticleSphere(hp, player.chestPos, 0.2, player.vel, 1 / 30, h, 0.1, impulse);
-      if (s >= 0) onPlayerStruck(hand, s, impulse, 'body');
-    }
-    // his kicks: mostly at your legs (jump over them), sometimes your body
+    for (const hand of opp.handList) strikePlayer(opp.p[hand.name], hand, h);
+    // his kicks: mostly at your legs (jump over them), sometimes your body or head
     const k = opp.kickSlot.punch;
-    if (k && player.mode !== 'down') {
-      const fp = opp.p[k.foot];
-      let s = collideParticleSphere(fp, player.legPos, LEGS_RADIUS, player.vel, 1 / 40, h, 0.1, impulse);
-      if (s >= 0) onPlayerStruck(opp.kickSlot, s, impulse, 'legs');
-      s = collideParticleSphere(fp, player.chestPos, 0.2, player.vel, 1 / 30, h, 0.1, impulse);
-      if (s >= 0) onPlayerStruck(opp.kickSlot, s, impulse, 'body');
-      s = collideParticleSphere(fp, player.headPos, player.headRadius, player.headVel, 1 / 5, h, 0.1, impulse);
-      if (s >= 0) onPlayerStruck(opp.kickSlot, s, impulse, 'head');
-    }
+    if (k && !k.hit) strikePlayer(opp.p[k.foot], opp.kickSlot, h, player.mode === 'down');
   }
   if (iter === 0) {
-    bodyContact();
+    bodyContact(h);
     if (arena.collideCage(opp.list, player) > 0.05 && opp.mode !== 'fight') arena.excitement += 0.02;
+    arena.collideCage(player.body.list, player);
   }
 };
 
-function bodyContact() {
-  const R = 0.3;
-  for (const name of BODY_PARTS) {
-    const p = opp.p[name];
-    if (p.pos.y > player.headBase.y + 0.2) continue;
-    const dx = p.pos.x - player.pos.x, dz = p.pos.z - player.pos.z;
-    const d = Math.hypot(dx, dz);
-    const minD = R + p.radius;
-    if (d < minD && d > 1e-6) {
-      const pen = minD - d, nx = dx / d, nz = dz / d;
-      p.pos.x += nx * pen * 0.8; p.pos.z += nz * pen * 0.8;
-      player.pos.x -= nx * pen * 0.2; player.pos.z -= nz * pen * 0.2;
-    }
+/** The two bodies are solid to each other: chests, hips and legs bump and shove for real. */
+function bodyContact(h) {
+  const mine = player.body.p;
+  for (const a of BODY_PARTS) {
+    const p = opp.p[a];
+    for (const b of BODY_PARTS) collideParticles(p, mine[b], h, 0.1);
   }
 }
 
@@ -176,7 +174,7 @@ function onGloveContact(g, p, speed) {
   let dmg, cons, bal = 0;
   if (isKick) {
     if (p.region === 'head') { dmg = v * 3.0; cons = dmg * 2.2; bal = 25; }         // head kick
-    else if (p.region === 'low') { dmg = v * 1.1; cons = 2; bal = v * 9; }           // leg kick: chops the legs out
+    else if (p.region === 'low') { dmg = v * 1.1; cons = 2; bal = v * 7; }           // leg kick: chops the legs out
     else { dmg = v * 2.0 * (p.region === 'guard' ? 0.4 : 1); cons = dmg * 0.4; bal = v * 4; }
   } else {
     const mult = p.region === 'head' ? 1 : pu.type === 'bodyhook' ? 0.9 : 0.6;
@@ -203,8 +201,8 @@ function onGloveContact(g, p, speed) {
   if (opp.health <= 0 || opp.cons <= 0) oppKnockdown({ name: (counter ? 'COUNTER ' : '') + name, speed, energy });
 }
 
-function onPlayerStruck(hand, speed, imp, region) {
-  if (player.mode !== 'fight') { player.takeHit(imp, 0, region === 'legs' ? 'body' : region); return; }
+function onPlayerStruck(hand, speed, imp, region, physical = false) {
+  if (player.mode !== 'fight') { player.takeHit(imp, 0, region === 'legs' ? 'body' : region, physical); return; }
   const pu = hand.punch;
   let dmg = 0;
   // Only a glove still travelling forward does damage, not one on its way back.
@@ -229,7 +227,7 @@ function onPlayerStruck(hand, speed, imp, region) {
     if (dmg > 6) game.hitStop = Math.min(0.08, dmg * 0.004);
     if (player.mode === 'tripped') { banner('SWEPT!'); sfx.crowdCheer(0.8); }
   }
-  player.takeHit(imp, dmg, region === 'legs' ? 'body' : region);
+  player.takeHit(imp, dmg, region === 'legs' ? 'body' : region, physical);
   if ((player.mode === 'fight' || player.mode === 'tripped') && (player.health <= 0 || player.cons <= 0)) playerKnockdown();
 }
 
