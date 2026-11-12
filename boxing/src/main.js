@@ -9,6 +9,8 @@ import { Arena } from './arena.js';
 import { Sfx } from './audio.js';
 import { PhysicsDebugView } from './debug.js';
 import { Net, cleanName } from './net.js';
+import { SnapshotBuffer, lerpAngle } from './netsync.js';
+import RAPIER from './rapier.js';
 import { TouchControls, isTouchDevice } from './touch.js';
 
 const TOUCH = isTouchDevice();
@@ -103,7 +105,7 @@ function onContact(r) {
   }
   // his fist or kicking foot against you
   const st = a.striker && a.owner === opp ? a : b.striker && b.owner === opp ? b : null;
-  if (!st) return;
+  if (!st || opp.remote) return;   // (online his strikes are tested from his gloves themselves: see remoteStrikes)
   const o = st === a ? b : a;
   const slot = st.fist ? st.hand : opp.kickSlot.punch && opp.kickSlot.punch.foot === st.name ? opp.kickSlot : null;
   if (!slot) return;
@@ -154,7 +156,8 @@ function keepEyesOut() {
 // ---------------------------------------------------------------- the referee
 /** A strike (yours or his) landed on the referee. src: your glove / his hand or kick slot. */
 function onRefereeStruck(src, info, speed, byPlayer) {
-  if (referee.mode === 'down' || game.phase !== 'fight' || mp.on) return;
+  if (referee.mode === 'down' || game.phase !== 'fight' || !referee.active) return;
+  if (mp.on && !byPlayer) return;   // online, each fighter reports their own strikes on him (the host applies them)
   const pu = src.punch;
   if (!pu || pu.refHit || speed < 1.5 || pu.phase === 'wind' || (byPlayer ? pu.done : pu.hit)) return;
   pu.refHit = true;
@@ -164,18 +167,46 @@ function onRefereeStruck(src, info, speed, byPlayer) {
   const v = Math.max(0, speed - 2.0) * power;
   const region = info.region === 'head' ? 'head' : 'body';
   const dmg = v * 2.3 * (region === 'head' ? 1 : 0.6) * (kick ? 1.3 : 1);
-  referee.takeHit(dmg, region, { cons: region === 'head' ? dmg * 1.9 : dmg * 0.4, bal: kick ? v * 5 : 0 });
   rock(referee, dmg);
   sfx.punch(Math.min(1.4, speed / 9), region);
   const energy = 0.5 * (byPlayer ? (kick ? 6 : 3) : 3) * speed * speed;
   showImpact(byPlayer ? 'YOU HIT THE REF!' : 'HE HIT THE REF!', speed, energy);
   arena.excitement += 0.5;
   if (byPlayer) logEvent('hit', 'REF SHOT', { dmg, speed, energy });
-  if (referee.health <= 0 || referee.cons <= 0) refereeKnockout(byPlayer, { speed, energy });
+  if (mp.on && mp.role === 'guest') {   // the host's referee is the real one: tell the host
+    mp.refSeq++;
+    mp.refLog = [...mp.refLog, [mp.refSeq, r3(dmg), region === 'head' ? 0 : 1, kick ? 1 : 0, r3(speed)]].slice(-4);
+    return;
+  }
+  hurtReferee(dmg, region, kick, v, byPlayer, { speed, energy });
+}
+
+function hurtReferee(dmg, region, kick, v, byPlayer, info) {
+  referee.takeHit(dmg, region, { cons: region === 'head' ? dmg * 1.9 : dmg * 0.4, bal: kick ? v * 5 : 0 });
+  if (referee.health <= 0 || referee.cons <= 0) refereeKnockout(byPlayer, info);
+}
+
+/** (Host) the guest's strikes on the referee, as they reported them. */
+function readRefereeHits(list) {
+  if (!list || mp.role !== 'host') return;
+  for (const h of [...list].sort((x, y) => num(x?.[0], 0, 1e9) - num(y?.[0], 0, 1e9))) {
+    if (!Array.isArray(h)) continue;
+    const seq = num(h[0], 0, 1e9) | 0;
+    if (seq <= mp.lastRefHit) continue;
+    mp.lastRefHit = seq;
+    if (referee.mode === 'down' || mp.m.phase !== 'fight') continue;
+    const dmg = num(h[1], 0, 60), region = h[2] === 0 ? 'head' : 'body', kick = h[3] === 1;
+    showImpact('HE HIT THE REF!', num(h[4], 0, 30), 0);
+    hurtReferee(dmg, region, kick, dmg / 2.3, false, { speed: num(h[4], 0, 30), energy: 0 });
+  }
 }
 
 /** The referee is out cold: both fighters go down with him. No winner. */
 function refereeKnockout(byPlayer, info) {
+  if (mp.on) {   // online: the host calls it, and both screens play it out (see onMatchPhase 'refko')
+    if (mp.role === 'host' && mp.m.phase !== 'refko' && mp.m.phase !== 'over') { mp.m.phase = 'refko'; mp.m.epoch++; mp.phaseT = 0; }
+    return;
+  }
   referee.knockDown();
   for (const h of [...opp.handList, opp.kickSlot]) h.punch = null;
   player.knockDown();
@@ -508,6 +539,7 @@ function toMenu() {
   player.reset(0, 2.4, 0);
   opp.reset(0, 0, 0);
   referee.setActive(true);
+  referee.net = null;
   referee.reset(2.2, 0.9, -Math.PI / 2);
   setGlovesVisible(false);
 }
@@ -759,7 +791,9 @@ const TYPES = ['straight', 'hook', 'uppercut', 'bodyhook', 'superman'];
 const TYPE_POWER = { straight: 1, hook: 1.15, uppercut: 1.15, bodyhook: 1.1, superman: 1.6, kick: 1.3 };
 const MODES = ['fight', 'idle', 'down', 'rising', 'tripped'];
 const remoteBody = { pos: new THREE.Vector3(), vel: new THREE.Vector3(), head: new THREE.Vector3(0, 1.6, 0), gloves: [new THREE.Vector3(), new THREE.Vector3()], yaw: 0,
-  kickPos: new THREE.Vector3(), jumpY: 0 };
+  kickPos: new THREE.Vector3(), jumpY: 0, ready: false,
+  gloveVel: [new THREE.Vector3(), new THREE.Vector3()], kickVel: new THREE.Vector3(),
+  gloveFrom: [new THREE.Vector3(), new THREE.Vector3()], kickFrom: new THREE.Vector3() };
 const mp = { on: false };
 const _gv = new THREE.Vector3();
 const num = (v, lo, hi, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d);
@@ -769,6 +803,7 @@ function resetMp(role) {
   Object.assign(mp, {
     on: !!role, role, started: false, peer: null, rs: null, lastSeen: performance.now(), joinT: performance.now(),
     hitSeq: mp.hitSeq || 0, hitLog: [], lastConfirm: 0, lastInfo: null, names: new Map(),
+    snaps: new SnapshotBuffer(), refSeq: mp.refSeq || 0, refLog: [], lastRefHit: 0,
     m: { phase: 'waiting', round: 1, timer: ROUND_TIME, count: 0, down: null, winner: null, method: null, epoch: 0 },
     applied: '', shownCount: -1, phaseT: 0, countT: 0,
   });
@@ -791,34 +826,140 @@ function myState() {
     ...player.gloves[0].particle.pos.toArray(), ...player.gloves[1].particle.pos.toArray(),
     ...player.leg.particle.pos.toArray(), player.jumpY].map(r3);
   const st = { role: mp.role, name: net.name, s, k, mode: player.mode, hp: r3(player.health), kd: player.knockdowns, c: r3(player.cons),
-    taken: r3(game.stats.taken), ctr: game.time < game.counterUntil ? 1 : 0 };
+    taken: r3(game.stats.taken), ctr: game.time < game.counterUntil ? 1 : 0,
+    ts: Math.round(performance.now() * 10) / 10 };   // when this was sent (our clock): they play us back smoothly from these
   if (mp.hitLog.length) st.hit = mp.hitLog;
-  if (mp.role === 'host') { st.m = mp.m; st.opp = mp.peer; }
+  if (mp.refLog.length) st.rh = mp.refLog;          // (guest) my strikes on the referee, for the host to apply
+  if (mp.role === 'host') {
+    st.m = mp.m; st.opp = mp.peer;
+    // the referee: the host runs him; the guest's copy follows this
+    const rp = referee.p.pelvis.pos;
+    st.ref = [rp.x, rp.z, referee.yaw, MODES.indexOf(referee.mode), referee.counting ? 1 : 0, referee.cons].map(r3);
+  }
   return st;
 }
 
+/**
+ * Their latest state: what must act at once (mode, health, hits, the match) is taken now; where
+ * they are and what their hands and feet are doing goes into the snapshot buffer, to be played
+ * back smoothly a little in the past (see applyRemoteView).
+ */
 function readRemote(p) {
   const pr = p.presence || {};
   const s = pr.s, k = pr.k;
   if (!Array.isArray(s) || s.length !== 18 || !Array.isArray(k) || k.length !== 12) return false;
-  const r = remoteBody;
-  r.pos.set(num(s[0], -3.2, 3.2), 0, num(s[1], -3.2, 3.2));
-  r.vel.set(num(s[2], -5, 5), 0, num(s[3], -5, 5));
-  r.yaw = num(s[4], -1e4, 1e4);
-  r.head.set(num(s[5], -3.5, 3.5), num(s[6], 0.2, 2.2, 1.6), num(s[7], -3.5, 3.5));
-  r.gloves[0].set(num(s[8], -3.5, 3.5), num(s[9], 0, 2.4, 1.3), num(s[10], -3.5, 3.5));
-  r.gloves[1].set(num(s[11], -3.5, 3.5), num(s[12], 0, 2.4, 1.3), num(s[13], -3.5, 3.5));
-  for (const g of r.gloves) if (g.distanceTo(r.head) > 1.1) g.sub(r.head).setLength(1.1).add(r.head);   // no impossible reach
-  r.kickPos.set(num(s[14], -3.5, 3.5), num(s[15], 0, 2.2, 0.1), num(s[16], -3.5, 3.5));
-  r.jumpY = num(s[17], 0, 1);
+  const V = (x, y, z) => new THREE.Vector3(x, y, z);
+  const snap = {
+    ts: num(pr.ts, 0, 1e12, p.t ?? performance.now()),
+    pos: V(num(s[0], -3.2, 3.2), 0, num(s[1], -3.2, 3.2)),
+    vel: V(num(s[2], -5, 5), 0, num(s[3], -5, 5)),
+    yaw: num(s[4], -1e4, 1e4),
+    head: V(num(s[5], -3.5, 3.5), num(s[6], 0.2, 2.2, 1.6), num(s[7], -3.5, 3.5)),
+    gloves: [V(num(s[8], -3.5, 3.5), num(s[9], 0, 2.4, 1.3), num(s[10], -3.5, 3.5)), V(num(s[11], -3.5, 3.5), num(s[12], 0, 2.4, 1.3), num(s[13], -3.5, 3.5))],
+    kickPos: V(num(s[14], -3.5, 3.5), num(s[15], 0, 2.2, 0.1), num(s[16], -3.5, 3.5)),
+    jumpY: num(s[17], 0, 1),
+    k: k.slice(),
+    ref: Array.isArray(pr.ref) && pr.ref.length === 6 ? pr.ref.map((x) => num(x, -1e4, 1e4)) : null,
+  };
+  for (const g of snap.gloves) if (g.distanceTo(snap.head) > 1.1) g.sub(snap.head).setLength(1.1).add(snap.head);   // no impossible reach
+  mp.snaps.push(snap, p.t ?? performance.now());
   mp.rs = {
     mode: MODES.includes(pr.mode) ? pr.mode : 'idle', hp: num(pr.hp, 0, 100, 100), kd: num(pr.kd, 0, 9) | 0,
     taken: num(pr.taken, 0, 1e5), ctr: pr.ctr === 1, name: cleanName(pr.name), cons: num(pr.c, 0, 100, 100),
     hit: Array.isArray(pr.hit) ? pr.hit : null, m: pr.m && typeof pr.m === 'object' ? pr.m : null,
     opp: typeof pr.opp === 'string' ? pr.opp : null,
+    rh: Array.isArray(pr.rh) ? pr.rh : null,
   };
-  mirrorPunches(k);
   return true;
+}
+
+const _rg = [new THREE.Vector3(), new THREE.Vector3()], _rk = new THREE.Vector3();
+const refTarget = { pos: new THREE.Vector3(), yaw: 0, mode: 'idle', counting: false, cons: 100 };
+/** Show them as they were a moment ago, blended between snapshots (called every frame). */
+function applyRemoteView(now, dt) {
+  const smp = mp.snaps.sample(now);
+  if (!smp) return;
+  const { a, b, u, ex } = smp;
+  const r = remoteBody;
+  // last frame's glove and foot positions, to measure how fast they're moving now
+  _rg[0].copy(r.gloves[0]); _rg[1].copy(r.gloves[1]); _rk.copy(r.kickPos);
+  r.pos.lerpVectors(a.pos, b.pos, u).addScaledVector(b.vel, ex);
+  r.vel.lerpVectors(a.vel, b.vel, u);
+  r.yaw = lerpAngle(a.yaw, b.yaw, u);
+  r.head.lerpVectors(a.head, b.head, u).addScaledVector(b.vel, ex);
+  r.gloves[0].lerpVectors(a.gloves[0], b.gloves[0], u).addScaledVector(b.vel, ex);
+  r.gloves[1].lerpVectors(a.gloves[1], b.gloves[1], u).addScaledVector(b.vel, ex);
+  r.kickPos.lerpVectors(a.kickPos, b.kickPos, u);
+  r.jumpY = a.jumpY + (b.jumpY - a.jumpY) * u;
+  if (!r.ready) { _rg[0].copy(r.gloves[0]); _rg[1].copy(r.gloves[1]); _rk.copy(r.kickPos); r.ready = true; }
+  for (let i = 0; i < 2; i++) r.gloveVel[i].subVectors(r.gloves[i], _rg[i]).multiplyScalar(1 / Math.max(dt, 1e-3));
+  r.kickVel.subVectors(r.kickPos, _rk).multiplyScalar(1 / Math.max(dt, 1e-3));
+  r.gloveFrom[0].copy(_rg[0]); r.gloveFrom[1].copy(_rg[1]); r.kickFrom.copy(_rk);
+  // what their hands and feet were doing at that moment (so a punch's phase matches where its glove is)
+  mirrorPunches(u < 0.5 ? a.k : b.k);
+  // the referee, as the host has him (guest)
+  const ra = a.ref, rb = b.ref || a.ref;
+  if (ra && mp.role === 'guest') {
+    refTarget.pos.set(ra[0] + (rb[0] - ra[0]) * u, 0, ra[1] + (rb[1] - ra[1]) * u);
+    refTarget.yaw = lerpAngle(ra[2], rb[2], u);
+    refTarget.mode = MODES[rb[3] | 0] || 'idle';
+    refTarget.counting = rb[4] === 1;
+    refTarget.cons = rb[5];
+    referee.net = refTarget;
+  }
+}
+
+/**
+ * Their strikes on you, online: tested straight from where their gloves and kicking foot are
+ * shown (the path each moved along this frame), not through their body's muscles, so a punch
+ * lands exactly when and where it looks like it does. Your guard first, then your head, then
+ * your body.
+ */
+const _sp = new THREE.Vector3(), _sd = new THREE.Vector3(), _hitDir = new THREE.Vector3();
+const _probe = new RAPIER.Ball(0.09), _qid = { x: 0, y: 0, z: 0, w: 1 };
+function segPointDist(a, b, c) {
+  _sd.subVectors(b, a);
+  const l2 = _sd.lengthSq();
+  const t = l2 > 1e-10 ? Math.min(1, Math.max(0, _sp.subVectors(c, a).dot(_sd) / l2)) : 1;
+  return _sp.copy(a).addScaledVector(_sd, t).distanceTo(c);
+}
+function remoteStrikes() {
+  if (!opp.remote || !remoteBody.ready || player.mode === 'down') return;
+  const r = remoteBody;
+  const strikes = opp.handList.map((h, i) => ({ slot: h, from: r.gloveFrom[i], to: r.gloves[i], vel: r.gloveVel[i], name: i === 0 ? 'handL' : 'handR', hand: h }));
+  const kp = opp.kickSlot.punch;
+  if (kp) strikes.push({ slot: opp.kickSlot, from: r.kickFrom, to: r.kickPos, vel: r.kickVel, name: kp.foot, kicker: opp.kickSlot });
+  for (const st of strikes) {
+    const pu = st.slot.punch;
+    if (!pu || pu.hit || pu.blocked || pu.phase === 'wind' || pu.phase === 'none') continue;
+    const speed = Math.max(st.vel.length(), pu.speed || 0);
+    _hitDir.copy(st.vel).normalize();
+    const info = { kind: 'body', owner: opp, region: st.kicker ? 'low' : 'guard', mass: st.kicker ? 6 : 3, name: st.name, hand: st.hand, kicker: st.kicker, fist: !!st.hand, foot: !!st.kicker };
+    // 1. your guard (a glove in the way, when you're guarding or punching)
+    if (!st.kicker) {
+      let blocked = false;
+      for (const g of player.gloves) {
+        if (!(player.guarding || g.punch)) continue;
+        if (segPointDist(st.from, st.to, g.particle.pos) < 0.18) { onGloveContact(g, info, speed); blocked = true; break; }
+      }
+      if (blocked || pu.hit) continue;
+    }
+    // 2. your head
+    if (segPointDist(st.from, st.to, player.headCenter) < 0.13 + 0.09) {
+      onPlayerStruck(st.slot, speed, impulse.copy(_hitDir).multiplyScalar(speed * (st.kicker ? 3 : 1.5)), 'head');
+      continue;
+    }
+    // 3. your body and legs (your real ragdoll's colliders where the glove or foot is now)
+    let region = null;
+    world.world.intersectionsWithShape(st.to, _qid, _probe, (c) => {
+      const inf = world.info.get(c.handle);
+      if (!inf || inf.owner !== player.body || inf.part === undefined) return true;
+      if (inf.part.startsWith('upperArm') || inf.part.startsWith('foreArm') || inf.part === 'head') return true;   // (your arms and head are the first-person ones)
+      region = inf.part.startsWith('thigh') || inf.part.startsWith('shin') || inf.part.startsWith('foot') ? 'legs' : 'body';
+      return false;
+    });
+    if (region) onPlayerStruck(st.slot, speed, impulse.copy(_hitDir).multiplyScalar(speed * (st.kicker ? 3 : 1.5)), region, true);
+  }
 }
 
 const AI_NAME = (type, i) => (type === 'straight' ? (i === 0 ? 'jab' : 'cross') : type === 'hook' ? (i === 0 ? 'hookL' : 'hookR')
@@ -966,6 +1107,9 @@ function hostTick(dt, dtReal) {
     case 'rest':
       if (mp.phaseT > 4.5) { m.round++; m.timer = ROUND_TIME; set('intro'); }
       break;
+    case 'refko':   // the referee is out cold, and both fighters with him: no contest
+      if (mp.phaseT > 3.5) { m.winner = 'none'; m.method = 'REFEREE KO'; set('over'); }
+      break;
     default:
       break;
   }
@@ -995,6 +1139,7 @@ function onMatchPhase(m) {
       const [x, z, yaw] = myCorner(), [ox, oz, oyaw] = theirCorner();
       player.resetKeepHealth(x, z, yaw);
       opp.resetKeepHealth(ox, oz, oyaw);
+      referee.reset(1.9, 0, -Math.PI / 2);
       player.mode = 'idle'; opp.mode = 'idle';
       $('count').textContent = '';
       setPhase('intro');
@@ -1019,10 +1164,22 @@ function onMatchPhase(m) {
       banner(`END OF ROUND ${game.round}`);
       setPhase('rest');
       break;
+    case 'refko':
+      referee.knockDown();
+      for (const h of [...opp.handList, opp.kickSlot]) h.punch = null;
+      player.knockDown();
+      opp.knockDown();
+      game.slowmo = 0.6;
+      sfx.crowdCheer(1.6);
+      arena.excitement = 2.5;
+      banner('REFEREE DOWN!');
+      setPhase('knockdown');
+      break;
     case 'over': {
       if (game.phase === 'kocam') endKoCam();
       const w = m.winner;
-      finish(w === 'draw' ? null : w === mp.role, typeof m.method === 'string' ? m.method.slice(0, 12) : 'DECISION');
+      if (w === 'none') finish(null, 'REFEREE KNOCKOUT', 'NO CONTEST');
+      else finish(w === 'draw' ? null : w === mp.role, typeof m.method === 'string' ? m.method.slice(0, 12) : 'DECISION');
       break;
     }
     default:
@@ -1042,7 +1199,12 @@ function beginOnlineMatch() {
   combo.cur = null; combo.clips = [];
   opp.remote = remoteBody;
   opp.diff = MP_DIFF;
-  referee.setActive(false);   // (online matches have no referee yet: each side would see its own)
+  // the referee: the host runs him, the guest's copy follows the host's (see applyRemoteView)
+  referee.setActive(true);
+  referee.net = null;
+  referee.reset(1.9, 0, -Math.PI / 2);
+  mp.snaps.reset();
+  remoteBody.ready = false;
   mp.lastConfirm = Math.max(0, ...(mp.rs?.hit || []).map(hitSeqOf));   // ignore reports from before this match
   const [x, z, yaw] = myCorner(), [ox, oz, oyaw] = theirCorner();
   player.reset(x, z, yaw);
@@ -1068,6 +1230,10 @@ function mpUpdate(dt, dtReal, now) {
   }
   // `t` is when their latest state arrived; a held copy from a dropped link doesn't count as hearing them.
   if (rp && readRemote(rp)) mp.lastSeen = Math.max(mp.lastSeen, rp.t ?? now);
+  if (mp.started) {
+    applyRemoteView(now, dtReal);
+    if (game.phase === 'fight' || game.phase === 'knockdown') remoteStrikes();
+  }
   mp.silent = mp.started && now - mp.lastSeen > 1500;
 
   if (!mp.started) {
@@ -1093,7 +1259,7 @@ function mpUpdate(dt, dtReal, now) {
     $('netwarn').hidden = !(mp.silent && game.phase !== 'over');
     // a dropped link gets time to reconnect before it counts as leaving
     if (now - mp.lastSeen > 12000 && game.phase !== 'over') { $('netwarn').hidden = true; opponentLeft(); return; }
-    if (mp.rs) { syncRemoteMode(); readConfirms(mp.rs.hit); }
+    if (mp.rs) { syncRemoteMode(); readConfirms(mp.rs.hit); readRefereeHits(mp.rs.rh); }
     if (mp.role === 'host') hostTick(dt, dtReal);
     applyMatch(mp.role === 'host' ? mp.m : mp.rs?.m);
     // getting up: mash Space, allowed from the count of 3
@@ -1525,7 +1691,8 @@ function substep(h) {
 toMenu();
 let last = performance.now();
 let acc = 0;
-renderer.setAnimationLoop((now) => {
+/** One frame: physics steps, game rules, camera and drawing. */
+function frame(now) {
   const dtReal = Math.min(0.05, (now - last) / 1000);
   last = now;
   if (game.paused && !mp.on) { touch?.setVisible(false); renderer.render(scene, camera); return; }
@@ -1548,7 +1715,10 @@ renderer.setAnimationLoop((now) => {
   updatePhase(dt, dtReal);
   opp.think(dt, ctx);
   refCtx.time = game.time;
-  refCtx.down = game.downWho === 'opp' && opp.mode === 'down' ? opp.p.pelvis.pos : game.downWho === 'player' && player.mode === 'down' ? player.body.p.pelvis.pos : null;
+  if (mp.on) {
+    const m = mp.role === 'host' ? mp.m : mp.rs?.m;
+    refCtx.down = m?.phase === 'knockdown' ? (m.down === mp.role ? player.body.p.pelvis.pos : opp.p.pelvis.pos) : null;
+  } else refCtx.down = game.downWho === 'opp' && opp.mode === 'down' ? opp.p.pelvis.pos : game.downWho === 'player' && player.mode === 'down' ? player.body.p.pelvis.pos : null;
   refCtx.counting = !!refCtx.down && game.phase === 'knockdown';
   if (referee.active) referee.think(dt, refCtx);
 
@@ -1580,7 +1750,8 @@ renderer.setAnimationLoop((now) => {
   }
   touch?.setVisible(inMatch() && !game.paused && !game.overlay && game.phase !== 'kocam' && game.phase !== 'reel');
   renderer.render(scene, camera);
-});
+}
+renderer.setAnimationLoop(frame);
 
 // handy for tinkering from the console
-window.game = { renderer, scene, debugView, referee, refCtx, ctx, substep, camera, game, player, opp, world, arena, startMatch, oppKnockdown, mp, net, combo, reel, rateAt, watchHighlights, finishCombo, recordFrame, startKoCam, updateReel, finish };
+window.game = { renderer, scene, debugView, referee, refCtx, ctx, substep, frame, camera, game, player, opp, world, arena, startMatch, oppKnockdown, mp, net, combo, reel, rateAt, watchHighlights, finishCombo, recordFrame, startKoCam, updateReel, finish };

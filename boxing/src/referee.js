@@ -42,6 +42,7 @@ export class Referee extends Opponent {
    *        counting (true while he counts), time }
    */
   think(dt, ctx) {
+    if (this.net) { this.followNet(dt); return; }
     if (this.mode === 'down') { this.tone = Math.max(0, this.tone - dt * 5); return; }
     if (this.mode === 'tripped') {
       this.tone = Math.max(0.03, this.tone - dt * 6);
@@ -100,6 +101,34 @@ export class Referee extends Opponent {
     // counting: his right arm chops down once a second
     this.counting = !!ctx.counting;
     this.countArm = this.counting ? (ctx.time % 1) : 0;
+  }
+
+  /**
+   * Online (guest): the host runs the referee, and this copy follows what the host sends:
+   * where he is, which way he faces, whether he's down, and when he's counting.
+   * this.net: { pos, yaw, mode, counting, cons }.
+   */
+  followNet(dt) {
+    const t = this.net;
+    if (t.mode === 'down' && this.mode !== 'down') this.knockDown();
+    else if (t.mode === 'tripped' && (this.mode === 'idle' || this.mode === 'fight')) this.trip();
+    else if ((t.mode === 'idle' || t.mode === 'fight' || t.mode === 'rising') && (this.mode === 'down' || this.mode === 'tripped')) this.rise(this.health, true);
+    if (this.mode === 'down' || this.mode === 'tripped') { this.tone = Math.max(this.mode === 'tripped' ? 0.03 : 0, this.tone - dt * 5); return; }
+    if (this.mode === 'rising') {
+      this.tone = Math.min(1, this.tone + dt * 0.75);
+      if (this.riseT >= 1.25) { this.tone = 1; this.mode = 'idle'; this.steadyT = 1; }
+      return;
+    }
+    this.cons = t.cons;
+    this.tone = 0.45 + 0.55 * Math.pow(this.cons / 100, 0.7);
+    // walk to where the host has him (a little ahead of the error, and no faster than he walks)
+    this.desiredVel.set((t.pos.x - this.base.x) * 3, 0, (t.pos.z - this.base.z) * 3);
+    const sp = this.desiredVel.length();
+    if (sp > 2.2) this.desiredVel.multiplyScalar(2.2 / sp);
+    this.desiredYaw = t.yaw;
+    this.leanT = 0.03; this.slipT = 0; this.twistT = 0; this.crouchT = t.counting ? 0.12 : 0.03;
+    this.counting = t.counting;
+    this.countArm = this.counting ? (performance.now() / 1000) % 1 : 0;
   }
 
   handTarget(hand, h, ctx, out) {

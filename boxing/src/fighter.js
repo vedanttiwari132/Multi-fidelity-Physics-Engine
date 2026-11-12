@@ -198,6 +198,8 @@ export class Opponent {
         const r = this.remote;
         _w.set(r.pos.x + r.vel.x * 0.05, 0, r.pos.z + r.vel.z * 0.05);
         this.desiredVel.set(r.vel.x + (_w.x - this.rig.com.x) * 6, 0, r.vel.z + (_w.z - this.rig.com.z) * 6);
+        const sp = Math.hypot(this.desiredVel.x, this.desiredVel.z);
+        if (sp > 5) this.desiredVel.multiplyScalar(5 / sp);   // (a burst of lag never flings the body)
         this.desiredYaw = r.yaw + Math.PI;
       }
       if (this.pilot) this.balance = this.pilot.balance;
