@@ -128,7 +128,7 @@ function regionMaterial(colors, cuts) {
   const C = (c) => new THREE.Color(c);
   const cut = (cuts || new THREE.Vector4(-9, 9, 9, 0)).clone();
   if (colors.trousers) cut.y = 0.13;   // full-length trousers instead of shorts
-  const U = { uSkin: { value: C(colors.skin) }, uShorts: { value: C(colors.shorts) }, uTrim: { value: C(colors.trim) }, uHair: { value: C(colors.hair) },
+  const U = m.userData.U = { uSkin: { value: C(colors.skin) }, uShorts: { value: C(colors.shorts) }, uTrim: { value: C(colors.trim) }, uHair: { value: C(colors.hair) },
     uShirt: { value: C(colors.shirt ?? colors.skin) }, uShirtOn: { value: colors.shirt != null ? 1 : 0 }, uCut: { value: cut } };
   m.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, U);
@@ -239,7 +239,9 @@ export class SkinnedBody {
       const part = rig.parts[BONE_PART[bones[i].name]];
       const t = part.body.translation(), r = part.body.rotation();
       _bq.set(r.x, r.y, r.z, r.w);
+      const g = this.girth ? girthOf(bones[i].name, this.girth) : 1;
       const m = this.bones[i].matrixWorld.compose(_bp.set(t.x, t.y, t.z), _bq, ONE).multiply(this._off[i]);
+      if (g !== 1) m.multiply(_gm.makeScale(g, 1, g));   // (a bone's own y axis runs along it: thicker across x and z)
       if (i === this._neck) {   // halfway between the chest and the head
         const c = rig.parts.chest.body.rotation();
         _bq2.set(c.x, c.y, c.z, c.w).slerp(_bq, 0.5).multiply(this.t.rest[i].q);
@@ -248,18 +250,28 @@ export class SkinnedBody {
       }
     }
     // arms drawn exactly onto given fists (see Ragdoll.armPose): each bone at its joint, turned
-    // like its part, and stretched along its length (the bone's own x axis) if the fist is far
+    // like its part, and stretched along its length (the bone's own y axis) if the fist is far
     if (arms) {
       for (const s of ['L', 'R']) {
         const a = arms[s];
         if (!a) continue;
         const iu = this.index['upperArm' + s], il = this.index['foreArm' + s], ih = this.index['hand' + s];
-        _bs.set(a.k, 1, 1);
+        const gl = this.girth ? this.girth.limbs : 1;
+        _bs.set(gl, a.k, gl);   // stretched along the bone (its y axis), as thick as the fighter's limbs
         this.bones[iu].matrixWorld.compose(a.S, _bq.copy(a.up).multiply(this.t.rest[iu].q), _bs);
         this.bones[il].matrixWorld.compose(a.E, _bq.copy(a.lo).multiply(this.t.rest[il].q), _bs);
         this.bones[ih].matrixWorld.compose(a.H, _bq.copy(a.lo).multiply(this.t.rest[ih].q), ONE);
       }
     }
+  }
+
+  /** New colours (any of skin, shorts, trim, hair). */
+  setColors(c) {
+    const U = this.mesh.material.userData.U;
+    if (c.skin != null) U.uSkin.value.setHex(c.skin);
+    if (c.shorts != null) U.uShorts.value.setHex(c.shorts);
+    if (c.trim != null) U.uTrim.value.setHex(c.trim);
+    if (c.hair != null) U.uHair.value.setHex(c.hair);
   }
 
   /** J: joint name -> Vector3 (world). hipMid is derived when missing. */
@@ -270,7 +282,14 @@ export class SkinnedBody {
   }
 }
 const ONE = new THREE.Vector3(1, 1, 1);
-const _bp = new THREE.Vector3(), _bq = new THREE.Quaternion(), _bq2 = new THREE.Quaternion(), _bs = new THREE.Vector3();
+const _bp = new THREE.Vector3(), _bq = new THREE.Quaternion(), _bq2 = new THREE.Quaternion(), _bs = new THREE.Vector3(), _gm = new THREE.Matrix4();
+/** How much thicker a bone is drawn, across its length, for a fighter's bulk. */
+function girthOf(name, g) {
+  if (name === 'pelvis' || name === 'spine' || name === 'chest') return g.torso;
+  if (name === 'neck') return (1 + g.torso) / 2;
+  if (name.startsWith('upperArm') || name.startsWith('foreArm') || name.startsWith('thigh') || name.startsWith('shin')) return g.limbs;
+  return 1;
+}
 /** Which ragdoll body part each bone rides on. */
 const BONE_PART = {
   pelvis: 'pelvis', spine: 'spine', chest: 'chest', neck: 'head', head: 'head',

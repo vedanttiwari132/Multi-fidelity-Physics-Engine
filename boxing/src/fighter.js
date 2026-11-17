@@ -11,6 +11,8 @@ import * as THREE from 'three';
 import { clampToOctagon, OCT_APOTHEM } from './arena.js';
 import { buildHumanTemplate, SkinnedBody, makeGlove, toonMaterial } from './body.js';
 import { Ragdoll, JOINTS } from './ragdoll.js';
+import { statsFor } from './profile.js';
+import { buildHairGroup, paintsScalp } from './hair.js';
 
 const V3 = (a) => new THREE.Vector3(a[0], a[1], a[2]);
 /** Rest pose, in the fighter's own frame (facing +z, its left is +x). */
@@ -130,8 +132,18 @@ export class Opponent {
       feet: { L: { target: this.footT.footL, pole: new THREE.Vector3(), kick: false }, R: { target: this.footT.footR, pole: new THREE.Vector3(), kick: false } },
       drive: this.drive, airborne: false, headPitch: 0,
     };
+    /** What the fighter's weight does (see profile.js): power, speed, footwork, toughness... */
+    this.stats = statsFor(80);
     this.view = new FighterView(scene, this, opts.colors);
     this.reset(0, -1.6, 0);
+  }
+
+  /** Become this fighter: weight (how they move and hit, and how heavy and bulky the body is) and look. */
+  applyProfile(profile) {
+    this.profile = profile;
+    this.stats = statsFor(profile.kg);
+    this.rig.setWeight(this.stats);
+    this.view.setLook(profile, this.stats);
   }
 
   setDifficulty(key) { this.diff = DIFFICULTY[key] || DIFFICULTY.normal; }
@@ -207,7 +219,7 @@ export class Opponent {
       if (this.pilot) this.pilot.balance = this.balance;
       let dy = this.desiredYaw - this.yaw;
       dy = Math.atan2(Math.sin(dy), Math.cos(dy));
-      const turn = this.pilot || this.remote ? 14 : 10;   // you turn your body as fast as you can step it round
+      const turn = (this.pilot || this.remote ? 14 : 10) * this.stats.move;   // you turn your body as fast as you can step it round
       this.yaw += Math.max(-turn * h, Math.min(turn * h, dy));
     } else {
       this.support = 0;
@@ -285,7 +297,7 @@ export class Opponent {
       const want = _f.copy(this.desiredVel);
       if (this.burstT > 0) want.add(this.burst);
       let ax = (want.x - vx) * 11, az = (want.z - vz) * 11;
-      const lim = 0.85 * 9.81 * (grounded === 2 ? 1 : 0.6) * this.tone * (0.4 + 0.6 * this.support) * (dash ? (this.pilot.dashT > 0 ? 2.6 : 2.0) : 1);
+      const lim = 0.85 * 9.81 * (grounded === 2 ? 1 : 0.6) * this.tone * (0.4 + 0.6 * this.support) * (dash ? (this.pilot.dashT > 0 ? 2.6 : 2.0) : 1) * this.stats.move;
       const al = Math.hypot(ax, az);
       if (al > lim) { ax *= lim / al; az *= lim / al; }
       this.drive.set(ax, 0, az);
@@ -381,7 +393,7 @@ export class Opponent {
 
   /** Roundhouse kick path for the kicking foot. */
   kickTarget(k, h, out) {
-    k.t += h;
+    k.t += h * this.stats.speed;
     const d = k.def, sd = d.side;
     const X = this.dirToWorld(_l.set(1, 0, 0), _x);  // its left
     const Z = this.forward;
@@ -457,7 +469,7 @@ export class Opponent {
 
     const pu = hand.punch;
     if (!pu) return out;
-    pu.t += h;
+    pu.t += h * this.stats.speed;   // light fighters are quick with everything, heavyweights wind up
     const d = pu.def;
     const X = this.dirToWorld(_l.set(1, 0, 0), _x);  // its left
     const Z = this.forward;
@@ -647,7 +659,7 @@ export class Opponent {
     }
 
     const dazed = this.daze > 0.6;
-    const speed = this.diff.speed * (dazed ? 0.5 : 1) * (1 - 0.4 * (this.winded || 0));
+    const speed = this.diff.speed * this.stats.move * (dazed ? 0.5 : 1) * (1 - 0.4 * (this.winded || 0));
     const range = 0.84;   // (arms are rigid now: 64 cm shoulder to fist, so he has to be in range to land)
     const px = -uz, pz = ux;
     let radial = 0, lateral = 0;
@@ -743,7 +755,7 @@ export class Opponent {
   takeHit(dmg, region, extra = {}) {
     this.health = Math.max(0, this.health - dmg);
     this.cons = Math.max(0, this.cons - (extra.cons ?? (region === 'head' ? dmg * 1.7 : dmg * 0.35)));
-    this.balance -= (extra.bal || 0) * (1 + 0.8 * (1 - this.cons / 100));   // dazed fighters are easier to sweep
+    this.balance -= (extra.bal || 0) * (1 + 0.8 * (1 - this.cons / 100)) / this.stats.tough;   // dazed fighters are easier to sweep; heavy ones harder
     this.lastHitT = this.clock;
     this.relax[region === 'head' ? 'head' : 'body'] = Math.min(0.5, 0.15 + dmg * 0.012);
     if (region !== 'head') this.winded = Math.min(1, (this.winded || 0) + dmg * 0.05);
@@ -824,6 +836,8 @@ class FighterView {
 
     const dark = toonMaterial({ color: 0x1b1210 });
     const white = toonMaterial({ color: 0xf6f2ea });
+    this.browMat = toonMaterial({ color: C.hair });
+    this.C = C;
     const sphere = new THREE.SphereGeometry(1, 24, 16);
     const add = (geo, mat, parent = this.group) => {
       const m = new THREE.Mesh(geo, mat);
@@ -850,7 +864,7 @@ class FighterView {
       const ey = 0.03, ez = front(JOINTS.head[1] + ey, sx * 0.05);
       const eye = add(sphere, white, this.head); eye.scale.set(0.026, 0.028, 0.012); eye.position.set(sx * 0.05, ey, ez - 0.002);
       const pupil = add(sphere, dark, this.head); pupil.scale.set(0.012, 0.014, 0.006); pupil.position.set(sx * 0.047, ey - 0.002, ez + 0.008);
-      const brow = add(new THREE.BoxGeometry(1, 1, 1), dark, this.head); brow.scale.set(0.05, 0.013, 0.014);
+      const brow = add(new THREE.BoxGeometry(1, 1, 1), this.browMat, this.head); brow.scale.set(0.05, 0.013, 0.014);
       brow.position.set(sx * 0.05, ey + 0.04, front(JOINTS.head[1] + ey + 0.04, sx * 0.05) + 0.002); brow.rotation.z = sx * -0.25;   // a scowl
     }
     // a set mouth with the gumshield just showing
@@ -860,11 +874,10 @@ class FighterView {
 
     // 4 oz open-finger MMA gloves (left glove: thumb toward its right, i.e. local -x); the referee has none
     this.gloves = [];
-    for (const side of C.noGloves ? [] : ['L', 'R']) {
-      const { group: g, material: mat } = makeGlove(side === 'L' ? -1 : 1, { glove: C.glove, strap: 0x1e1e24, band: 0xf6f2ea, skin: C.skin });
-      this.group.add(g);
-      this.gloves.push({ g, mat, handState: f.hands[side], hand: f.p['hand' + side], elbow: f.p['elbow' + side] });
-    }
+    if (!C.noGloves) this.makeGloves(C.glove, C.skin);
+    // hair and facial hair ride on the head (see hair.js)
+    this.hairGroup = null;
+    if (C.hairStyle) this.setHair({ hair: C.hairStyle, hairColor: C.hair, beard: 'none', beardColor: C.hair, skin: C.skin });
     // a kicking foot glows as a warning
     this.footGlow = ['L', 'R'].map((side) => {
       const m = new THREE.Mesh(sphere, new THREE.MeshBasicMaterial({ color: 0xff5020, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
@@ -872,6 +885,33 @@ class FighterView {
       this.group.add(m);
       return { m, name: 'foot' + side, foot: f.p['foot' + side], glow: 0 };
     });
+  }
+
+  makeGloves(color, skin) {
+    for (const g of this.gloves) { this.group.remove(g.g); g.g.traverse((o) => o.geometry?.dispose()); }
+    this.gloves = ['L', 'R'].map((side) => {
+      const { group: g, material: mat } = makeGlove(side === 'L' ? -1 : 1, { glove: color, strap: 0x1e1e24, band: 0xf6f2ea, skin });
+      this.group.add(g);
+      return { g, mat, handState: this.f.hands[side], hand: this.f.p['hand' + side], elbow: this.f.p['elbow' + side] };
+    });
+  }
+
+  setHair(look) {
+    if (this.hairGroup) { this.head.remove(this.hairGroup); this.hairGroup.traverse((o) => o.geometry?.dispose()); }
+    this.hairGroup = buildHairGroup(getHumanTemplate(), JOINTS.head, look);
+    this.head.add(this.hairGroup);
+  }
+
+  /** Dress the fighter: skin, shorts, waistband, gloves, hair and facial hair; and how bulky they are. */
+  setLook(p, stats) {
+    const hairPaint = paintsScalp(p.hair) ? p.hairColor : p.skin;
+    this.body.setColors({ skin: p.skin, shorts: p.shorts, trim: p.trim, hair: hairPaint });
+    this.browMat.color.setHex(p.hair === 'bald' && p.beard === 'none' ? 0x2a1a10 : p.hair === 'bald' ? p.beardColor : p.hairColor);
+    // (rebuilt only when they change: the weight slider shouldn't regrow the hair every tick)
+    const gk = `${p.gloves},${p.skin}`, hk = [p.hair, p.hairColor, p.beard, p.beardColor, p.skin].join(',');
+    if (!this.C.noGloves && gk !== this._gk) { this._gk = gk; this.makeGloves(p.gloves, p.skin); }
+    if (hk !== this._hk) { this._hk = hk; this.setHair(p); }
+    this.body.girth = stats ? { torso: stats.girth, limbs: stats.limbs } : null;
   }
 
   get visible() { return this.group.visible; }

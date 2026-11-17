@@ -5,6 +5,8 @@ import { PhysicsWorld } from './sim.js';
 import { Opponent, PUNCH_LABEL } from './fighter.js';
 import { Player } from './player.js';
 import { Referee } from './referee.js';
+import { SKIN, GLOVES, SHORTS, TRIM, HAIR, HAIR_LABEL, HAIR_COLORS, BEARD, BEARD_LABEL, KG_MIN, KG_MAX,
+  className, statsFor, loadProfile, saveProfile, randomProfile, nickname, packProfile, unpackProfile, hex } from './profile.js';
 import { Arena } from './arena.js';
 import { Sfx } from './audio.js';
 import { PhysicsDebugView } from './debug.js';
@@ -42,6 +44,10 @@ const arena = new Arena(scene, world);
 const player = new Player(world, scene);
 const opp = new Opponent(world, scene, { index: 1 });
 const referee = new Referee(world, scene);
+const myProfile = loadProfile();
+player.applyProfile(myProfile);
+let oppProfile = randomProfile(myProfile);
+opp.applyProfile(oppProfile);
 const refCtx = { a: player.pos, b: opp.base, down: null, counting: false, time: 0 };
 const debugView = new PhysicsDebugView(scene, world);
 debugView.fighters = [opp];   // V also shows his hitboxes
@@ -163,8 +169,8 @@ function onRefereeStruck(src, info, speed, byPlayer) {
   pu.refHit = true;
   if (byPlayer) pu.done = true; else pu.hit = true;   // it was spent on him
   const kick = byPlayer ? pu.type === 'kick' : pu.def.kind === 'kick';
-  const power = byPlayer ? pu.power : opp.diff.power * pu.def.power;
-  const v = Math.max(0, speed - 2.0) * power;
+  const power = byPlayer ? pu.power * player.stats.power : opp.diff.power * pu.def.power * opp.stats.power;
+  const v = Math.max(0, speed / (byPlayer ? player.stats.speed : opp.stats.speed) - 2.0) * power;
   const region = info.region === 'head' ? 'head' : 'body';
   const dmg = v * 2.3 * (region === 'head' ? 1 : 0.6) * (kick ? 1.3 : 1);
   rock(referee, dmg);
@@ -280,7 +286,9 @@ function onGloveContact(g, p, speed) {
 
   const counter = opp.isPunching() || game.time < game.counterUntil;
   const cm = counter ? 1.25 : 1;
-  const v = Math.max(0, speed - 2.2) * pu.power;
+  // your weight: a strike is judged against your own hand speed (a heavyweight's full-effort punch is
+  // slower, but it's still full effort), then your power: heavy hits like a truck, light hits soft
+  const v = Math.max(0, speed / player.stats.speed - 2.2) * pu.power * player.stats.power;
   let dmg, cons, bal = 0;
   if (isKick) {
     if (p.region === 'head') { dmg = v * 3.0; cons = dmg * 2.2; bal = 25; }         // head kick
@@ -324,7 +332,7 @@ function onPlayerStruck(hand, speed, imp, region, physical = false) {
     const kick = pu.def.kind === 'kick';
     if (kick && !pu.mirror) endKick(pu);   // his foot stops on you and comes back
     const counter = mp.on ? (mp.rs?.ctr || player.gloves.some((g) => g.punch?.phase === 'ext')) : false;
-    const v = Math.max(0, speed - 2.0) * opp.diff.damage * pu.def.power * (counter ? 1.25 : 1);
+    const v = Math.max(0, speed / opp.stats.speed - 2.0) * opp.diff.damage * pu.def.power * opp.stats.power * (counter ? 1.25 : 1);
     dmg = v * 2.4 * (region === 'head' ? 1 : region === 'legs' ? 0.3 : 0.5);
     if (region === 'body' && player.guarding) dmg *= 0.5;
     const cons = region === 'head' ? dmg * 1.6 : region === 'body' ? dmg * 0.3 : 1;
@@ -355,6 +363,9 @@ function goFullscreen() {
 function startMatch() {
   goFullscreen();
   sfx.init();
+  oppProfile = randomProfile(myProfile);
+  opp.applyProfile(oppProfile);
+  $('opp-name').textContent = `${nickname(oppProfile.kg)} · ${oppProfile.kg} KG`;
   referee.setActive(true);
   opp.setDifficulty(game.difficulty);
   player.reset(0, 1.45, 0);
@@ -827,7 +838,8 @@ function myState() {
     ...player.leg.particle.pos.toArray(), player.jumpY].map(r3);
   const st = { role: mp.role, name: net.name, s, k, mode: player.mode, hp: r3(player.health), kd: player.knockdowns, c: r3(player.cons),
     taken: r3(game.stats.taken), ctr: game.time < game.counterUntil ? 1 : 0,
-    ts: Math.round(performance.now() * 10) / 10 };   // when this was sent (our clock): they play us back smoothly from these
+    ts: Math.round(performance.now() * 10) / 10,     // when this was sent (our clock): they play us back smoothly from these
+    look: packProfile(myProfile) };                  // how you look and what you weigh
   if (mp.hitLog.length) st.hit = mp.hitLog;
   if (mp.refLog.length) st.rh = mp.refLog;          // (guest) my strikes on the referee, for the host to apply
   if (mp.role === 'host') {
@@ -870,6 +882,12 @@ function readRemote(p) {
     opp: typeof pr.opp === 'string' ? pr.opp : null,
     rh: Array.isArray(pr.rh) ? pr.rh : null,
   };
+  // their look and weight (applied when it changes)
+  const lk = Array.isArray(pr.look) ? JSON.stringify(pr.look) : null;
+  if (lk && lk !== mp.lookKey) {
+    const prof = unpackProfile(pr.look);
+    if (prof) { mp.lookKey = lk; oppProfile = prof; opp.applyProfile(prof); }
+  }
   return true;
 }
 
@@ -1390,6 +1408,9 @@ async function mpLeave(toLobby = false) {
   opp.remote = null;
   opp.setDifficulty(game.difficulty);
   $('opp-name').textContent = '"THE BRICK"';
+  mp.lookKey = null;
+  oppProfile = randomProfile(myProfile);
+  opp.applyProfile(oppProfile);
   setOverlay(false);
   $('waiting').classList.add('hidden');
   toMenu();
@@ -1734,9 +1755,17 @@ function frame(now) {
   arena.updateCrowd(dtReal);
   opp.view.update();
   referee.view.update();
+  if (creator.open) player.avatar.update();   // (your own body is only drawn in the creator and replays)
   debugView.update();
 
-  if (game.phase === 'menu') {
+  if (game.phase === 'menu' && creator.open) {
+    const b = player.body.p.pelvis.pos, f = player.body.forward;
+    const a = Math.atan2(f.x, f.z) + 0.55 + Math.sin(game.time * 0.35) * 0.5;
+    camera.position.set(b.x + Math.sin(a) * 2.3, 1.35, b.z + Math.cos(a) * 2.3);
+    // (look a little to the left of the fighter, so he stands clear of the panel)
+    const s = innerWidth > 720 ? 0.55 : 0;
+    camera.lookAt(b.x - Math.cos(a) * s, 1.0 - (innerWidth > 720 ? 0 : 0.35), b.z + Math.sin(a) * s);
+  } else if (game.phase === 'menu') {
     const a = game.time * 0.12;
     camera.position.set(Math.sin(a) * 2.9, 1.75, Math.cos(a) * 2.9);   // inside the cage
     camera.lookAt(opp.p.chest.pos.x, 1.2, opp.p.chest.pos.z);
@@ -1752,6 +1781,95 @@ function frame(now) {
   renderer.render(scene, camera);
 }
 renderer.setAnimationLoop(frame);
+
+// ---------------------------------------------------------------- character creator
+const creator = { open: false };
+const STAT_ROWS = [['POWER', 'power', 0.62, 1.9], ['HAND SPEED', 'speed', 0.7, 1.32], ['FOOTWORK', 'move', 0.7, 1.26], ['TOUGHNESS', 'tough', 0.7, 1.45]];
+
+function swatches(id, list, key) {
+  const box = $(id);
+  box.textContent = '';
+  for (const c of list) {
+    const b = document.createElement('button');
+    b.className = 'swatch';
+    b.style.background = hex(c);
+    b.title = hex(c);
+    b.dataset.v = c;
+    b.addEventListener('click', () => setLook({ [key]: c }));
+    box.append(b);
+  }
+}
+function styleButtons(id, list, labels, key) {
+  const box = $(id);
+  box.textContent = '';
+  for (const v of list) {
+    const b = document.createElement('button');
+    b.textContent = labels[v];
+    b.dataset.v = v;
+    b.addEventListener('click', () => setLook({ [key]: v }));
+    box.append(b);
+  }
+}
+function refreshCreator() {
+  const p = myProfile;
+  $('cr-kg').value = p.kg;
+  $('cr-class').textContent = className(p.kg);
+  $('cr-kgval').textContent = `${p.kg} kg · ${Math.round(p.kg * 2.2046)} lb`;
+  const st = statsFor(p.kg), box = $('cr-stats');
+  box.textContent = '';
+  for (const [label, k, lo, hi] of STAT_ROWS) {
+    const l = document.createElement('div'); l.textContent = label;
+    const bar = document.createElement('div'); bar.className = 'sbar';
+    const fill = document.createElement('i'); fill.style.width = `${Math.round(12 + 88 * (st[k] - lo) / (hi - lo))}%`;
+    bar.append(fill); box.append(l, bar);
+  }
+  const mark = (id, v) => { for (const b of $(id).children) b.classList.toggle('sel', b.dataset.v === String(v)); };
+  mark('cr-skin', p.skin); mark('cr-gloves', p.gloves); mark('cr-shorts', p.shorts); mark('cr-trim', p.trim);
+  mark('cr-hair', p.hair); mark('cr-haircol', p.hairColor); mark('cr-beard', p.beard); mark('cr-beardcol', p.beardColor);
+}
+function setLook(patch) {
+  Object.assign(myProfile, patch);
+  player.applyProfile(myProfile);
+  saveProfile(myProfile);
+  refreshCreator();
+}
+function openCreator() {
+  $('menu').classList.add('hidden');
+  $('creator').classList.remove('hidden');
+  creator.open = true;
+  // your fighter in the middle of the cage, everyone else out of the way
+  player.reset(0, 0, Math.PI);
+  opp.reset(0, -2.7, 0);
+  referee.reset(2.6, 0.8, -Math.PI / 2);
+  player.body.view.visible = true;
+  opp.view.visible = false;
+  referee.view.visible = false;
+  refreshCreator();
+}
+function closeCreator() {
+  creator.open = false;
+  $('creator').classList.add('hidden');
+  $('menu').classList.remove('hidden');
+  player.body.view.visible = false;
+  opp.view.visible = true;
+  referee.view.visible = referee.active;
+  player.reset(0, 2.4, 0);
+  opp.reset(0, 0, 0);
+  referee.reset(2.2, 0.9, -Math.PI / 2);
+}
+swatches('cr-skin', SKIN, 'skin');
+swatches('cr-gloves', GLOVES, 'gloves');
+swatches('cr-shorts', SHORTS, 'shorts');
+swatches('cr-trim', TRIM, 'trim');
+styleButtons('cr-hair', HAIR, HAIR_LABEL, 'hair');
+swatches('cr-haircol', HAIR_COLORS, 'hairColor');
+styleButtons('cr-beard', BEARD, BEARD_LABEL, 'beard');
+swatches('cr-beardcol', HAIR_COLORS, 'beardColor');
+$('cr-kg').min = KG_MIN; $('cr-kg').max = KG_MAX;
+$('cr-kg').addEventListener('input', (e) => setLook({ kg: Number(e.target.value) }));
+$('cr-random').addEventListener('click', () => setLook(randomProfile()));
+$('cr-done').addEventListener('click', closeCreator);
+$('customize-btn').addEventListener('click', openCreator);
 
 // handy for tinkering from the console
 window.game = { renderer, scene, debugView, referee, refCtx, ctx, substep, frame, camera, game, player, opp, world, arena, startMatch, oppKnockdown, mp, net, combo, reel, rateAt, watchHighlights, finishCombo, recordFrame, startKoCam, updateReel, finish };

@@ -11,6 +11,11 @@ A first-person MMA game in an octagon where the fighting is driven by physics, n
 - **Accurate hitboxes.** The colliders are the hitboxes: capsules measured off the skinned model along the forearms, upper arms, neck, ribcage, waist, hips, thighs, shins and feet, and a head capsule from the jaw to the back of the skull that tilts and turns with the head, so the whole cartoon head counts. A forearm in the way blocks, shins take leg kicks, and when a strike touches the guard and the head at once, the guard wins. Your own head hitbox moves with your eyes, so a slip or a duck counts the instant you make it, and it's centred where your skull is (just behind your eyes).
 - **Planted feet.** A foot that bears weight grips the canvas like a loaded sole, so feet don't skate around under the body; the body moves over them and steps. Everything is solid: a kick stops where it lands and comes back instead of swinging on through, the fighters can't sink into each other, and a fighter who's down can't bowl over the one still standing.
 - **The referee** is in the cage with you: a third ragdoll with the same body and balance, who keeps to the side of the action, backs off when you come at him and stands over a fighter who's down for the count. He doesn't fight, but stray punches and kicks from either of you hurt him, and **if the referee is knocked out, both fighters are knocked out with him**: the match ends as a no contest. 
+- **Build your own fighter.** *Customize fighter* on the menu opens a creator with a turntable view of you. Your **weight** (57–120 kg, flyweight to heavyweight) changes how you fight, not just how you look:
+  - **Heavier:** you hit far harder (a heavyweight's landed punch does about 3× a flyweight's), and you're harder to hurt and harder to sweep. But you wind up, punch, kick and move more slowly, and you tire faster. You're bigger too: a thicker body and limbs, and heavier body parts in the physics.
+  - **Lighter:** your hands, kicks and footwork are much faster and you recover stamina quicker, but each shot lands softer.
+  - **Looks:** pick a skin tone, glove, shorts and waistband colours, a hair style (bald, buzz cut, crop, mohawk, afro, man bun, spikes) and hair colour, and facial hair (stubble, moustache, goatee, full beard) and its colour.
+  - Your fighter is saved in the browser and shown to your opponent online. The AI picks a different random fighter, weight included, for each match.
 - **Blocking is physical.** Your gloves and his gloves are colliders, so a guard only works if the gloves are actually in the way.
 - **The cage** is solid: eight panels you (and he) can be pushed into.
 - **Telegraphed attacks.** The glove he's about to throw glows, and a ring around your sights lights up on the side it's coming from, with a hint for how to avoid it. Slip or duck it and he's left open for a counter.
@@ -101,6 +106,8 @@ On the claude.ai page the game uses the artifact `room` capability instead, whic
 | `src/quadmesh.js` | A small all-quad modelling kernel: extrude faces, Catmull–Clark subdivision (positions, bone weights and colours together) |
 | `src/models.js` | The box-modelled cartoon body, first-person arm and puffy MMA gloves |
 | `src/body.js` | The skeleton, skinning (bones ride on the ragdoll's parts), toon shading, outlines and colour regions |
+| `src/profile.js` | Your fighter: weight classes and what weight does (power, speed, footwork, toughness, stamina, size), colour palettes, saving and sending your look |
+| `src/hair.js` | Hair styles and facial hair, grown as shells over the head mesh |
 | `src/player.js` | First-person controller, PD-driven gloves, punch trajectories, head-recoil springs |
 | `src/arena.js` | Octagon cage, lights, crowd |
 | `src/main.js` | Fixed 240 Hz physics loop, contact → damage rules, the referee rule, rounds / knockdowns, knockout cam, online match flow, HUD, input |

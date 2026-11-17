@@ -12,6 +12,7 @@ import { solveTwoBone } from './physics.js';
 import { interactionGroups, GROUP } from './sim.js';
 import { SkinnedBody, buildArmTemplate, makeGlove, toonMaterial } from './body.js';
 import { Opponent } from './fighter.js';
+import { statsFor } from './profile.js';
 
 /** A Rapier body seen as a point ({ pos, prev, getVelocity }), refreshed after every step. */
 class BodyPoint {
@@ -140,6 +141,8 @@ export class Player {
     this.view = new GloveView(scene, this);
     this.legView = new LegView(scene, this);
     this.avatar = new PlayerAvatar(this);
+    /** What your weight does (see profile.js): power, speed, footwork, toughness, stamina. */
+    this.stats = statsFor(80);
     this.reset(0, 1.6, 0);
   }
 
@@ -167,6 +170,15 @@ export class Player {
     this.health = health; this.knockdowns = knockdowns; this.cons = Math.max(60, cons);
   }
 
+  /** Become this fighter: weight (how you move and hit, how heavy and bulky you are) and look. */
+  applyProfile(profile) {
+    this.profile = profile;
+    this.stats = statsFor(profile.kg);
+    this.body.applyProfile(profile);
+    this.view.setLook(profile, this.stats);
+    this.legView.setLook(profile);
+  }
+
   get staminaFactor() { return 0.45 + 0.55 * (this.stamina / 100); }
   get guarding() { return this.mode === 'fight' && (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight')); }
   get airborne() { return this.jumpY > 0.04; }
@@ -187,7 +199,7 @@ export class Player {
     this.stamina -= 8;
     const sy = Math.sin(this.yaw), cy = Math.cos(this.yaw);
     const [lx, lz] = { forward: [0, 1], back: [0, -1], left: [-1, 0], right: [1, 0] }[dir];
-    const speed = dir === 'left' || dir === 'right' ? 3.2 : 4.2;
+    const speed = (dir === 'left' || dir === 'right' ? 3.2 : 4.2) * this.stats.move;
     // the legs push off hard toward this velocity (see Opponent.balanceStep)
     this.dashVel.set((lx * cy - lz * sy) * speed, 0, (-lx * sy - lz * cy) * speed);
     this.dashT = 0.22; this.dashCd = 0.4;
@@ -215,7 +227,7 @@ export class Player {
   hurt(cons, balance = 0) {
     this.cons = Math.max(0, this.cons - cons);
     // the more dazed you are, the easier you are to sweep
-    this.balance -= balance * (1 + 0.8 * (1 - this.cons / 100));
+    this.balance -= balance * (1 + 0.8 * (1 - this.cons / 100)) / this.stats.tough;   // heavier is harder to sweep
     this.lastHitT = this.clock;
     if (this.balance <= 0 && this.mode === 'fight' && this.cons > 0 && this.health > 0) this.trip();
   }
@@ -289,7 +301,7 @@ export class Player {
       wz += Math.cos(this.clock * 0.61 + 1.3) * 0.7 * inst;
     }
     const kicking = !!this.leg.punch;
-    const maxSp = (this.guarding ? 1.5 : 2.3) * (0.7 + 0.3 * this.stamina / 100) * (kicking ? 0.35 : 1) * (1 - 0.35 * inst);
+    const maxSp = (this.guarding ? 1.5 : 2.3) * (0.7 + 0.3 * this.stamina / 100) * (kicking ? 0.35 : 1) * (1 - 0.35 * inst) * this.stats.move;
     this.dashT -= h; this.dashCd -= h;
     this.lastH = h;
     // You move exactly like he does: this is only the velocity your legs try to reach.
@@ -413,7 +425,7 @@ export class Player {
     }
 
     // --- stamina
-    this.stamina = Math.min(100, this.stamina + h * (this.guarding ? 7 : 15));
+    this.stamina = Math.min(100, this.stamina + h * (this.guarding ? 7 : 15) * this.stats.stamina);
 
     // --- your body follows (same muscles, legs and balance as the opponent)
     this.body.preStep(h, null);
@@ -426,15 +438,16 @@ export class Player {
     // A tired guard is a weak guard: heavy shots push your own gloves into your face.
     const sf = this.stamina / 100;
     const alert = 0.55 + 0.45 * this.cons / 100;   // dazed hands are slow
-    g.omega = (guard ? 28 * (0.55 + 0.45 * sf) : 18) * (0.7 + 0.3 * alert);
-    g.maxAcc = (guard ? 170 * (0.3 + 0.7 * sf) : 120) * alert;
+    const q = this.stats.speed;
+    g.omega = (guard ? 28 * (0.55 + 0.45 * sf) : 18) * (0.7 + 0.3 * alert) * q;
+    g.maxAcc = (guard ? 170 * (0.3 + 0.7 * sf) : 120) * alert * q * Math.sqrt(q);
     if (this.mode === 'down' || this.mode === 'rising' || this.mode === 'tripped') { g.omega = 10; return out.set(s * 0.26, -0.55, -0.3); }
     if (guard) out.set(s * 0.1, -0.05, -0.27);
     else out.set(s * 0.2, -0.17, -0.36);
 
     const pu = g.punch;
     if (!pu) return out;
-    pu.t += h;
+    pu.t += h * q;
     const d = pu.def;
     if (pu.t < d.wind) {
       pu.phase = 'wind';
@@ -448,8 +461,8 @@ export class Player {
         if (pu.type === 'superman') { this.vel.x += -Math.sin(this.yaw) * 3.2; this.vel.z += -Math.cos(this.yaw) * 3.2; }
       }
       const u = smooth((pu.t - d.wind) / d.ext);
-      g.omega = 42;
-      g.maxAcc = 240 * this.staminaFactor * Math.min(1.4, pu.power) * alert;
+      g.omega = 42 * q;
+      g.maxAcc = 240 * this.staminaFactor * Math.min(1.4, pu.power) * alert * q * Math.sqrt(q);
       if (pu.type === 'superman') {
         out.set(s * 0.03, -0.08 - this.jumpY, -1.05);   // thrown down from the top of the jump
         this.lungeT = 0.25; this.twistT = s * 0.08;
@@ -487,7 +500,8 @@ export class Player {
     out.set(s * 0.15, -1.42, -0.05);   // resting: down by your feet, out of the way
     const pu = g.punch;
     if (!pu) return out;
-    pu.t += h;
+    const q = this.stats.speed;
+    pu.t += h * q;
     const d = pu.def;
     if (pu.t < d.wind) {
       pu.phase = 'wind';
@@ -498,8 +512,8 @@ export class Player {
       const u = smooth((pu.t - d.wind) / d.ext);
       _a.set(s * 0.85, -0.88, -0.55); _b.set(-s * 0.4, -0.84, -1.2);   // swing through at thigh height
       out.lerpVectors(_a, _b, u);
-      g.omega = 36;
-      g.maxAcc = 320 * this.staminaFactor * pu.power * (0.55 + 0.45 * this.cons / 100);
+      g.omega = 36 * q;
+      g.maxAcc = 320 * this.staminaFactor * pu.power * (0.55 + 0.45 * this.cons / 100) * q * Math.sqrt(q);
       this.twistT = s * 0.18;
       this.balance -= h * 25;   // standing on one leg
     } else if (pu.t < d.wind + d.ext + d.ret) {
@@ -601,7 +615,7 @@ class GloveView {
     this.player = player;
     this.items = player.gloves.map((g) => {
       // 4 oz open-finger MMA gloves (thumb on the inside: local -x for your left glove)
-      const { group } = makeGlove(g.side, { glove: 0x2a66e0, strap: 0x1e1e24, band: 0xf6f2ea, skin: 0xd9a27c }, 0.0025);   // thin outline: it's right in front of you
+      const group = new THREE.Group();
       group.scale.setScalar(0.85);   // (the puffy gloves would fill the screen this close to your eyes)
       scene.add(group);
       // the arm, shoulder to wrist, as one skinned piece
@@ -609,6 +623,20 @@ class GloveView {
       const J = { shoulder: new THREE.Vector3(), elbow: new THREE.Vector3(), hand: new THREE.Vector3(), base: new THREE.Vector3(), latA: new THREE.Vector3(), latB: new THREE.Vector3() };
       return { g, group, arm, J };
     });
+    this.setLook({ gloves: 0x2a66e0, skin: 0xd9a27c });
+  }
+
+  /** Your gloves' colour and your skin. */
+  setLook(p) {
+    const key = `${p.gloves},${p.skin}`;
+    if (key === this._key) return;
+    this._key = key;
+    for (const it of this.items) {
+      for (const c of [...it.group.children]) { it.group.remove(c); c.traverse((o) => o.geometry?.dispose()); }
+      const { group } = makeGlove(it.g.side, { glove: p.gloves, strap: 0x1e1e24, band: 0xf6f2ea, skin: p.skin }, 0.0025);   // thin outline: it's right in front of you
+      it.group.add(group);
+      it.arm.setColors({ skin: p.skin, shorts: p.skin, trim: p.skin, hair: p.skin });
+    }
   }
 
   update(camera) {
@@ -641,8 +669,8 @@ class GloveView {
 class LegView {
   constructor(scene, player) {
     this.player = player;
-    const skin = toonMaterial({ color: 0xd9a27c });
-    const shorts = toonMaterial({ color: 0x1840c0 });
+    const skin = this.skin = toonMaterial({ color: 0xd9a27c });
+    const shorts = this.shorts = toonMaterial({ color: 0x1840c0 });
     const cyl = new THREE.CylinderGeometry(1, 1, 1, 12);
     this.thigh = new THREE.Mesh(cyl, shorts);
     this.shin = new THREE.Mesh(cyl, skin);
@@ -650,6 +678,8 @@ class LegView {
     this.foot.scale.set(0.055, 0.05, 0.12);
     for (const m of [this.thigh, this.shin, this.foot]) { m.castShadow = true; m.visible = false; scene.add(m); }
   }
+
+  setLook(p) { this.skin.color.setHex(p.skin); this.shorts.color.setHex(p.shorts); }
 
   update(camera) {
     const p = this.player, leg = p.leg;

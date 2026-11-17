@@ -191,6 +191,7 @@ export class Ragdoll {
           .setActiveHooks(R.ActiveHooks.FILTER_CONTACT_PAIRS)
           .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS | R.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(1);
         const c = this.world.createCollider(desc, body);
+        if (i === 0) part.mainCollider = c;
         const info = { kind: 'body', owner, rig: this, part: d.name, region: extra.region || d.region, mass: d.mass,
           name: extra.fist ? S(d.side, 'hand') : d.name.startsWith('foot') ? S(d.side, 'foot') : d.name,
           fist: !!extra.fist, foot: !!extra.foot, striker: !!(extra.fist || extra.foot), shape: kind, r };
@@ -200,6 +201,7 @@ export class Ragdoll {
       this.parts[d.name] = part;
       this.list.push(part);
       this.M += d.mass;
+      part.mass0 = d.mass; part.strength0 = d.strength;
       phys.recorded.push(body);
       phys.tracked.add(body);
     }
@@ -310,6 +312,28 @@ export class Ragdoll {
     if (this.dominance === g) return;
     this.dominance = g;
     for (const p of this.list) p.body.setDominanceGroup(g);
+  }
+
+  /**
+   * A fighter's weight (see profile.js statsFor): every part's mass is scaled, the torso and limb
+   * hitboxes are made bulkier or leaner (the head, fists and feet stay as they are), and the
+   * muscles get strength to carry the extra weight.
+   */
+  setWeight(s) {
+    this.M = 0;
+    for (const p of this.list) {
+      p.mass = p.mass0 * s.mass;
+      p.mainCollider.setMass(p.mass);
+      if (p.strength0) p.strength = p.strength0 * (0.55 + 0.45 * s.mass);
+      this.M += p.mass;
+    }
+    for (const info of this.colliders) {
+      const c = info.collider;
+      if (info.r0 === undefined) info.r0 = c.radius();
+      const kind = this.parts[info.part].part;
+      const g = info.fist || info.foot || info.region === 'head' ? 1 : kind === 'TORSO' ? s.girth : s.limbs;
+      c.setRadius(info.r0 * g);
+    }
   }
 
   /** Push a part (an impulse at a point, N·s). */
